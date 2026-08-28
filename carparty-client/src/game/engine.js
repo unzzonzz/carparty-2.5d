@@ -1434,13 +1434,16 @@ const CAM25 = {
   tan: 0,      // tan φ — 높이 → 월드 y 오프셋
   sin: 0,      // sin φ — 높이 → 화면 px (= tan × k). 압출 레이어 수를 여기서 뽑는다
 };
-let LOBBY_PITCH = 52;  // 로비 각도. [ ] 키로 2도씩 흔들어 보며 고르는 튜닝값 (44~60 권장)
+/* 로비 각도. 처음엔 52° 였는데 세로를 38%나 눌러 화면 전체가 납작해 보였다 —
+ *  40° 면 압축이 23% 로 줄어 눕은 건 눕은 대로 읽히면서 눌린 느낌이 빠진다.
+ *  [ ] 키로 2도씩 흔들어 보며 고른다(값은 좌상단 HUD). */
+let LOBBY_PITCH = 40;
 const MAX_OBJ_H = 150; // 가장 키 큰 오브젝트(트로피) 높이 — 컬링 상단 여유 계산에 쓴다
 
-/* 차량 압출 높이 (실험, 기본 0=끔). 주변이 전부 부피를 가지면 차만 납작해 보여서
- *  바디 실루엣을 이만큼 세워 보는 스위치다. 게이트 오브젝트를 먼저 눈으로 확인한 뒤
- *  \ 키로 켜서 비교하라는 뜻으로 기본값이 0 이다. 켤 땐 9 정도가 맞는다. */
-let CAR_EXTRUDE = 0;
+/* 차량 압출 높이. 주변이 전부 부피를 가지는데 차만 납작하면 차가 바닥에 그린 데칼로
+ *  보인다 — 바디 실루엣을 이만큼 세워 옆면을 만든다. 0 이면 꺼진다(\ 키로 토글해 비교).
+ *  차 렌더 길이가 약 63px 이니 11 은 실차 비율(1.4m/4.5m)보다 낮은, 납작한 장난감 톤이다. */
+let CAR_EXTRUDE = 11;
 
 function setPitch(deg) {
   CAM25.pitchDeg = clamp(deg, 0, 72); // 72°를 넘기면 바닥이 거의 선이 되어 주행 자체가 안 된다
@@ -3515,16 +3518,8 @@ function drawLobbyGround() {
     ctx.fillStyle = "rgba(255,255,255,0.12)";     // 2) 도색 톤 : 채도를 죽여 아스팔트에 칠한 색으로
     roundRect(gx, gy, g.w, g.h, r);
     ctx.fill();
-    ctx.strokeStyle = "#ffffff";                  // 3) 구획선 : 좌우 세로 2줄
-    ctx.lineWidth = 6;
-    ctx.beginPath();
-    for (const s of [-1, 1]) {
-      const x = g.x + s * (g.w / 2 - 10);
-      ctx.moveTo(x, g.y - (g.h / 2 - 12));
-      ctx.lineTo(x, g.y + (g.h / 2 - 12));
-    }
-    ctx.stroke();
-    // 4) 차막이 : 안쪽 끝(y 작은 쪽)에 낮은 압출 막대 둘. 차고는 오브젝트가 없어 차막이도 없다.
+    // 3) 차막이 : 안쪽 끝(y 작은 쪽)에 낮은 압출 막대 둘. 차고는 오브젝트가 없어 차막이도 없다.
+    //  좌우 흰 구획선은 뺐다 — 눕히면 베이 양옆에 세로 바가 서 있는 것처럼 읽혀 거슬린다.
     if (g.group !== "garage") {
       const stopSide = shadeHex(g.color, -0.28);
       const by = g.y - g.h / 2 + 16;
@@ -3533,7 +3528,7 @@ function drawLobbyGround() {
 
     const entering = lobby.gate === g && lobby.prog > 0;
     if (!entering) {
-      /* 5) 라벨 : 바닥 도색이라 역보정하지 않는다 — 눌린 채로 그려져야 칠한 글씨로 읽힌다.
+      /* 4) 라벨 : 바닥 도색이라 역보정하지 않는다 — 눌린 채로 그려져야 칠한 글씨로 읽힌다.
        *  서브라벨(N명 접속 중)은 뺐다. 베이 아래쪽에 글씨가 두 줄이면 오브젝트와 함께 답답하고,
        *  2.5D 에선 눌려서 읽히지도 않는다. */
       ctx.fillStyle = "#ffffff";
@@ -4088,7 +4083,8 @@ function drawCar(car, color = "#e8604c") {
   const L = car.length || CAR.length;
   const s = ((L + 10) / 232) * 1.15;  // 시각 크기 1.15배 (충돌 크기는 그대로)
   const rot = car.angle + Math.PI / 2; // 쉐입 전방(-y) → car.angle 전방(+x)
-  const lift = CAR_EXTRUDE > 0 ? drawCarStack(car, color, rot, s) : 0;
+  // 로비 밖(pitch 0)은 tan 이 0 이라 겹이 전부 같은 자리에 쌓인다 → 그리지 않는다(순수 낭비)
+  const lift = CAR_EXTRUDE > 0 && CAM25.tan > 0 ? drawCarStack(car, color, rot, s) : 0;
 
   ctx.save();
   carShapeTransform(car.x, car.y - lift, rot, s);

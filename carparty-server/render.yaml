@@ -1,0 +1,27 @@
+# Render 배포 설정 (Infrastructure as Code)
+# - Render 대시보드에서 "New +" → "Blueprint" 로 이 repo 를 연결하면
+#   이 파일을 읽어 자동으로 서비스를 생성한다.
+#
+# 클라이언트(carparty-client)는 별도 repo 이므로 여기서 빌드하지 않는다.
+# 이 서비스는 WebSocket 게임 서버로 동작하고, 클라이언트는 정적 호스팅에
+# 따로 올린 뒤 빌드 시 VITE_WS_URL 로 이 서비스를 가리키게 한다.
+#   예) VITE_WS_URL=wss://car-game.onrender.com/ws npm run build
+services:
+  - type: web
+    name: car-game
+    runtime: node
+    region: singapore     # 한국에서 가장 가까운 Render 리전 (US West 대비 지연 大↓)
+    plan: free            # 무료 플랜 (15분 미접속 시 잠듦 → 콜드스타트)
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true      # main 브랜치 푸시 시 자동 재배포
+    # "/" 는 클라이언트 빌드가 있을 때만 200 이다. 헬스체크는 전용 경로를 쓴다.
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      # Upstash Redis (계정/통계 영속) — 값은 Render 대시보드에서 설정(시크릿)
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false

@@ -1,0 +1,30 @@
+# Render 배포 설정 — 정적 사이트 (Infrastructure as Code)
+# - Render 대시보드에서 "New +" → "Blueprint" 로 이 repo 를 연결하면
+#   이 파일을 읽어 자동으로 Static Site 가 생성된다.
+#
+# VITE_WS_URL 은 게임 서버(carparty-server)의 WebSocket 주소다.
+# 값은 대시보드에서 실제 서비스 도메인으로 채운다 (sync: false).
+#   예) wss://car-game.onrender.com/ws
+# 지정하지 않으면 클라이언트는 접속한 호스트의 /ws 로 붙는다 — 정적 호스팅에
+# 따로 올리는 구성에서는 반드시 지정해야 한다.
+services:
+  - type: web
+    name: carparty-client
+    runtime: static
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    autoDeploy: true
+    envVars:
+      # Vite 6 + @vitejs/plugin-react 5 는 Node ^20.19 || >=22.12 를 요구한다.
+      # "20" 은 최신 20.x 로 풀려 조건을 만족하지만, 빌드 환경마다 다르게
+      # 해석되지 않게 못박아 둔다.
+      - key: NODE_VERSION
+        value: 22.12.0
+      - key: VITE_WS_URL
+        sync: false
+    # SPA 폴백(routes rewrite)은 두지 않는다.
+    #  이 앱은 경로 라우팅을 쓰지 않고(방 초대도 쿼리 ?room=), 게임 문서도 실제 파일인
+    #  /play.html 로 열린다. 그래서 폴백이 필요 없다. 반대로 `/* -> /index.html` 을 걸면
+    #  없는 .js 요청에 HTML 이 200 으로 돌아와 서비스워커 런타임 캐시가 오염되고
+    #  (public/sw.js 는 네트워크 우선 + 성공 응답을 캐시한다), 다음 배포 첫 로드가 깨진다.
+    #  Cloudflare Pages 에 _redirects 를 두지 않은 것과 같은 이유다 (README 참고).

@@ -1,0 +1,10 @@
+node_modules/
+*.log
+.DS_Store
+.env
+
+# 런타임 데이터 (DATA_DIR 로 위치 변경 가능)
+users.json
+records.json
+chat-log.jsonl
+ta-suspect.jsonl

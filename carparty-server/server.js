@@ -1,0 +1,3224 @@
+"use strict";
+
+/* =============================================================================
+ *  멀티플레이어 서버
+ * -----------------------------------------------------------------------------
+ *  역할 1) 빌드된 React 클라이언트(client/dist) 정적 서빙
+ *  역할 2) WebSocket 으로 플레이어 상태 릴레이
+ *
+ *  네트워크 모델 : "이동은 클라이언트 예측 + 충돌 판정은 서버 권위"
+ *  - 각 클라이언트가 자기 차량의 물리를 계산하고 상태(x, y, angle)를 보낸다.
+ *  - 서버는 모든 차량을 "한 프레임의 일관된 좌표"로 모아두고, 누가 누구를
+ *    들이받아 죽었는지(킬 판정)를 단독으로 결정한다. → 두 PC의 판정 불일치 제거.
+ *  - 판정 결과(사망/부활 위치/폭발)는 서버가 모두에게 통지한다.
+ *
+ *  실행 :  npm start (저장소 루트)   →  http://localhost:3000
+ *          개발 중에는 Vite 개발 서버(:5173)가 프런트를 띄우고 /ws 를 여기로 프록시한다.
+ * ========================================================================== */
+
+// .env 파일이 있으면 환경변수로 로드(로컬/자체서버용). 없거나 dotenv 미설치여도 무해.
+//  운영 플랫폼(Render 등)은 대시보드 환경변수를 쓰므로 .env 없이도 동작한다.
+try { require("dotenv").config(); } catch {}
+
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const { WebSocketServer } = require("ws");
+const { Redis } = require("@upstash/redis");
+const SIM = require("./sim.js"); // v4 : 결정론 시뮬 코어 — 클라이언트 repo 가 이 파일을 복제해 쓴다 (NETCODE.md §5)
+const PATHS = require("./paths.js");  // 데이터 파일 / 클라이언트 빌드 경로
+const TA = require("./ta-input.js");  // 타임어택 기록의 봇 판정 (입력 패턴 계측)
+const TRACKS = SIM.buildTracks();     // 서버도 전 코스 지오메트리를 안다 (노면/랩 게이트/스폰)
+
+const PORT = process.env.PORT || 3000;
+const TICK_RATE = 60;       // 초당 스냅샷 브로드캐스트 횟수 (60 → 더 매끈/낮은 지연, 대역폭 2배)
+const COLLISION_HZ = 60;    // 초당 충돌 판정 횟수
+
+// 판정용 월드/차량 상수 (클라이언트 game.js 의 값과 반드시 일치)
+const MAP_SIZE = 5000;      // 서바이벌 맵 크기 (정사각형)
+const CAR_LEN = 38;
+const CAR_WID = 18;
+// 광장(만남의 광장) : 자유 주행 사교 공간 — 승패/기록 없음. 클라 WORLD.plaza 와 일치.
+const PLAZA_W = 2800, PLAZA_H = 2000;
+//  네 곳 순환도로 진입점(스폰). 클라 PLAZA_SPAWNS 와 동일 좌표.
+const PLAZA_SPAWNS = [[1400, 240], [1400, 1760], [640, 1000], [2160, 1000]];
+// 가장 덜 붐비는 스폰을 골라 중앙 시계를 바라보게 배치
+function pickPlazaSpawn(selfId) {
+  let best = PLAZA_SPAWNS[0], bestD = -1;
+  for (const [x, y] of PLAZA_SPAWNS) {
+    let minD = Infinity;
+    for (const [pid, p] of players) {
+      if (pid === selfId || !p.active || p.mode !== "plaza" || !p.state) continue;
+      const d = Math.hypot(x - p.state.x, y - p.state.y);
+      if (d < minD) minD = d;
+    }
+    if (minD > bestD) { bestD = minD; best = [x, y]; }
+  }
+  const [x, y] = best;
+  return { x, y, angle: Math.atan2(PLAZA_H / 2 - y, PLAZA_W / 2 - x) }; // 중앙(시계)을 바라봄
+}
+// 스모(프로토타입) : 원형 링에서 늘어나는 주먹으로 상대를 링 밖으로 밀어내는 PvP. 클라 SUMO 상수와 일치.
+//  월드는 크게 두고 경계 없음(링 밖으로 나가면 클라가 1초 카운트다운 후 자멸). 넉백만 서버 권위.
+const SUMO_W = 5000, SUMO_H = 5000, SUMO_CX = 2500, SUMO_CY = 2500, SUMO_RING_R = 1050;
+const PUNCH_CD = 3000;      // 주먹 쿨다운(3초에 한 번)
+const PUNCH_REACH = 130;    // 글러브가 차 앞끝에서 더 뻗는 거리
+const PUNCH_FRONT = 30;     // 차 중심 → 앞 범퍼
+const PUNCH_EXTEND_MS = 120, PUNCH_HOLD_MS = 90; // 뻗기/유지 (히트 활성 구간 = 210ms)
+const PUNCH_HIT_R = 46;     // 글러브 히트 반경(+상대 차 반)
+const PUNCH_KNOCK = 2300;   // 넉백 발사 속도(px/s) — 클라가 주행 캡과 무관한 별도 속도로 시원하게 날림
+// 스폰 : 맵 가운데. 여럿이면 중앙 근처 작은 원에 흩어 겹치지 않게(가장 덜 붐비는 지점).
+function pickSumoSpawn(selfId) {
+  const cands = [[SUMO_CX, SUMO_CY]]; // 1순위 = 정중앙
+  for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4; cands.push([SUMO_CX + Math.cos(a) * 160, SUMO_CY + Math.sin(a) * 160]); }
+  let best = cands[0], bestD = -1;
+  for (const [x, y] of cands) {
+    let minD = Infinity;
+    for (const [pid, p] of players) {
+      if (pid === selfId || !p.active || p.mode !== "sumo" || !p.state) continue;
+      const d = Math.hypot(x - p.state.x, y - p.state.y);
+      if (d < minD) minD = d;
+    }
+    if (minD > bestD) { bestD = minD; best = [x, y]; }
+  }
+  const [x, y] = best;
+  return { x, y, angle: Math.random() * Math.PI * 2 }; // 중앙이라 아무 방향
+}
+
+const INVULN_MS = 1500;     // 부활/입장 후 무적 시간 (이 동안 죽지도 죽이지도 못함)
+const GRACE_MS = 500;       // 입장 직후 클라이언트의 옛 위치 전송을 무시하는 시간
+const TELEPORT_DIST = 200;  // 한 틱에 이 이상 움직이면 텔레포트로 간주(스윕 생략)
+//  레이싱은 충돌/킬이 없어 서버가 트랙 좌표를 알 필요 없다(클라가 출발점 결정).
+
+/* =============================================================================
+ *  치트 방어 (서버 권위) — 이동 "감지"(순간이동/초고속 플래그)는 오탐 문제로 제거.
+ *  남는 것은 감지가 아닌 순수 검증 :
+ *   1) 프로 랩/완주는 "단조 +1 & 최소 랩 시간" 일 때만 인정
+ *   2) 타임어택 기록은 "모드 체류 벽시계 시간" 하한으로만 인정
+ *   3) 속도/좌표는 물리 상한으로 클램프 (임펄스/스냅샷 인코딩 보호)
+ *  제재는 관리자 수동 판단 : /추방(즉시 퇴장) · /차단(계정 로그인 금지)
+ * ========================================================================== */
+const MIN_LAP_MS = 2500;      // 프로 한 바퀴 최소 소요(타임어택 하한 3s 보다 짧게 잡아 오탐 방지)
+
+/* v4 : 이동 예산(speedGuard) 폐지 — 클라는 위치가 아니라 "입력"만 보낼 수 있어
+ *  속도핵/텔레포트핵이 프로토콜 수준에서 불가능하다. */
+
+// 랩 게이트 기준점 리셋 (모드 진입/레이스 시작 시점에 호출)
+function resetMotion(p) {
+  p.lastLapT = Date.now();   // 마지막으로 랩을 인정한 시각
+}
+// 강제 퇴장 : 사유 통지 후 연결 종료 (클라는 30초 뒤에야 재접속 시도)
+function kickPlayer(p, reason) {
+  send(p, { type: "kicked", reason });
+  try { p.ws.close(); } catch {}
+}
+
+/* v4 : 차대차 충돌은 @carparty/sim 의 resolveCarCar(그룹 CCD)로 통합 틱에서 해석한다. */
+const CAR_HL = 27.6, CAR_HW = 13.2; // 히트박스 반길이/반폭 = 시각 차체 (shared SIM.CAR_HL/HW 와 동일)
+
+// 프로 맵 풀 : 서버가 인덱스만 정하고, 클라가 같은 인덱스로 동일 트랙을 생성한다.
+//  (game.js 의 PRO_COURSES = A-1~B-3 6종과 일치. 실제 선택 범위는 NAMED_COURSES)
+const PRO_RECIPE_COUNT = 9;
+
+// =============================================================================
+//  계정 / 로그인 (users.json 영속 저장, Node 내장 crypto 로 비밀번호 해시)
+// -----------------------------------------------------------------------------
+//  - 회원가입: 아이디 / 닉네임 / 비밀번호(8자 이상, 영문·숫자·특수기호)
+//  - 로그인: 아이디 + 비밀번호 해시 → 토큰 발급. 토큰으로 새로고침 시 자동 로그인.
+//    (비밀번호가 오가고 저장되는 방식은 아래 "비밀번호" 블록 주석 참고)
+//  - 아이디 unzzonzz = 관리자(금색 차).
+//  - 통계: 프로 우승 수(2명 이상일 때), 프로 플레이 수.
+// =============================================================================
+const ADMIN_ID = "unzzonzz";
+const GOLD = "#ffd94d";
+// 관리자 /이벤트 선물 목록 : 이름(공백 제거) → 수령 시 적용 내용. 새 이벤트는 여기에 추가.
+const SPACE_SKIN_COLOR = "#0b1026"; // 클라 SPACE_SKIN 과 동일해야 함 (33번째 스와치)
+const GIFT_ITEMS = { "우주스킨": { item: "spaceSkin" } };
+const DEFAULT_CAR_COLOR = "#e8604c"; // 기본 코랄 — 비소유자가 우주색을 보내면 이 색으로 대체
+// 우주 스킨 소유 확인 : 콘솔로 색만 바꿔 보내도 서버가 릴레이/저장에서 걸러낸다 (관리자는 허용)
+function ownsSpaceSkin(p) {
+  if (!p.account) return false;
+  if (p.account.userId === ADMIN_ID) return true;
+  const u = users[p.account.userId];
+  return !!(u && u.spaceSkin);
+}
+// 색 검증 : 형식 + 우주 스킨 소유 (모든 색 수신 경로 공통)
+function sanitizeColor(p, c) {
+  if (typeof c !== "string" || !/^#[0-9a-fA-F]{6}$/.test(c)) return null;
+  if (c.toLowerCase() === SPACE_SKIN_COLOR && !ownsSpaceSkin(p)) return DEFAULT_CAR_COLOR;
+  return c;
+}
+const USERS_FILE = PATHS.USERS_FILE;
+
+// 영속 저장 : 환경변수가 있으면 Upstash Redis, 없으면 로컬 users.json 파일로 폴백.
+//  메모리 캐시(users)를 두고 동기 읽기 + 변경 시 write-through 한다.
+const useRedis = !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
+const redis = useRedis
+  ? new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN })
+  : null;
+const USER_SET = "cargame:userids";
+const userKey = (id) => "cargame:user:" + id;
+
+let users = {}; // 메모리 캐시 (id -> {id,nickname,salt,hash,proWins,proPlays})
+
+// 시작 시 저장소에서 계정을 캐시로 적재
+async function hydrateUsers() {
+  if (!useRedis) {
+    try { users = JSON.parse(fs.readFileSync(USERS_FILE, "utf8")); } catch { users = {}; }
+    return;
+  }
+  try {
+    const ids = (await redis.smembers(USER_SET)) || [];
+    for (const id of ids) {
+      const u = await redis.get(userKey(id)); // @upstash/redis 가 JSON 자동 파싱
+      if (u) users[id] = u;
+    }
+    console.log(`[redis] loaded ${Object.keys(users).length} users`);
+  } catch (e) {
+    console.error("[redis] hydrate failed:", e.message);
+  }
+}
+
+let saveTimer = null;
+// 한 명의 계정 변경을 영속화 (Redis 또는 파일)
+function persistUser(id) {
+  if (!users[id]) return;
+  if (useRedis) {
+    redis.set(userKey(id), users[id]).catch((e) => console.error("[redis] set:", e.message));
+    redis.sadd(USER_SET, id).catch(() => {});
+  } else {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => fs.writeFile(USERS_FILE, JSON.stringify(users), () => {}), 200);
+  }
+}
+// -----------------------------------------------------------------------------
+//  비밀번호 : 서버는 원문을 저장하지도, 받지도 않는다.
+//   1) 클라이언트가 원문을 sha256(페퍼+아이디+원문) 으로 한 번 해싱해 pwh 로 보낸다
+//      → 서버 메모리·로그·DB 어디에도 원문이 남지 않는다 (다른 사이트와 비번을 돌려쓰는 경우까지 보호)
+//   2) 서버는 그 pwh 를 계정마다 다른 salt 로 scrypt 해싱해서 저장한다
+//      → 저장소가 통째로 새도 원문은 물론 pwh 도 복원할 수 없다
+//   전송 구간 자체의 보호는 wss(TLS) 담당이다. 1) 은 그 대체물이 아니라 저장·노출 대비책.
+//
+//  저장 형식은 3가지가 공존한다 (전부 로그인 가능, 성공하면 즉시 최신 형식으로 이관) :
+//   pwv:2 + salt/hash  = scrypt(pwh)   ← 현재 형식
+//   password           = 평문          ← 구 형식
+//   salt/hash (pwv 없음) = scrypt(원문) ← 더 옛 형식. 원문을 보내는 구버전 클라만 검증 가능
+// -----------------------------------------------------------------------------
+const PW_PEPPER = "carparty:v1:"; // 클라이언트와 반드시 동일해야 한다
+// 클라이언트가 보내는 것과 같은 1차 해시 (구버전 클라가 원문을 보냈을 때 서버가 대신 계산)
+function clientHash(id, pw) {
+  return crypto.createHash("sha256").update(PW_PEPPER + String(id).toLowerCase() + ":" + String(pw)).digest("hex");
+}
+const isPwh = (v) => typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
+// 들어온 자격증명을 pwh 로 정규화 : 신버전은 pwh, 구버전 클라는 원문 → 서버가 해싱
+function credOf(id, pwh, password) {
+  if (isPwh(pwh)) return pwh;
+  if (password != null && String(password) !== "") return clientHash(id, password);
+  return null;
+}
+// scrypt 는 일부러 느리다(수십 ms) → 동기 API 를 쓰면 그동안 게임 틱이 통째로 밀린다. 반드시 비동기.
+function scryptHash(secret, salt, cb) {
+  crypto.scrypt(String(secret), salt, 32, (err, buf) => cb(err ? null : buf.toString("hex")));
+}
+// 타이밍 공격 방지용 상수시간 비교 (길이가 다르면 바로 false)
+function eqConst(a, b) {
+  const A = Buffer.from(String(a)), B = Buffer.from(String(b));
+  return A.length === B.length && crypto.timingSafeEqual(A, B);
+}
+// 계정의 비밀번호를 최신 형식(pwv:2)으로 기록. 평문 흔적은 지운다.
+function setPassword(u, pwh, cb) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  scryptHash(pwh, salt, (h) => {
+    if (!h) { cb(false); return; }
+    u.pwv = 2; u.salt = salt; u.hash = h;
+    delete u.password;
+    cb(true);
+  });
+}
+// 비밀번호 검증 (비동기). cb(ok, upgradePwh)
+//  upgradePwh 가 있으면 = 구 형식 계정이 맞게 인증됐다는 뜻 → 최신 형식으로 다시 저장하면 된다.
+function verifyPassword(id, u, msg, cb) {
+  const pwh = credOf(id, msg.pwh, msg.password);
+  if (u.pwv === 2 && u.salt && u.hash) {
+    if (!pwh) { cb(false, null); return; }
+    scryptHash(pwh, u.salt, (h) => cb(!!h && eqConst(h, u.hash), null));
+    return;
+  }
+  if (u.password != null) { // 구 형식(평문) : 저장된 평문을 같은 방식으로 해싱해 비교
+    if (!pwh) { cb(false, null); return; }
+    cb(eqConst(pwh, clientHash(id, u.password)), pwh);
+    return;
+  }
+  if (u.salt && u.hash) { // 더 옛 형식(scrypt(원문)) : 원문이 있어야만 검증 가능
+    if (msg.password == null) { cb(false, null); return; }
+    scryptHash(msg.password, u.salt, (h) => cb(!!h && eqConst(h, u.hash), clientHash(id, msg.password)));
+    return;
+  }
+  cb(false, null);
+}
+// 로그인/가입 시도 제한 : scrypt 는 CPU 를 쓰므로 무제한으로 받으면 게임 틱까지 느려진다.
+//  연결당 10초에 5회, 그리고 검증이 진행 중이면 새 시도를 받지 않는다.
+function authAllow(p) {
+  if (p.authBusy) return false;
+  const now = Date.now();
+  p.authTimes = (p.authTimes || []).filter((t) => now - t < 10000);
+  if (p.authTimes.length >= 5) return false;
+  p.authTimes.push(now);
+  p.authBusy = true;
+  return true;
+}
+const wsOpen = (p) => p.ws.readyState === p.ws.OPEN; // 해싱하는 사이 끊겼는지
+// 검증 끝 → 다음 시도 허용. 그 사이 연결이 끊겼으면 false (콜백에서 더 진행하지 말 것)
+function authDone(p) {
+  p.authBusy = false;
+  return wsOpen(p);
+}
+// 새 비밀번호 정책 : 8~64자, 공백 없음, 영문·숫자·특수기호를 각각 1개 이상 포함.
+function validPassword(pw) {
+  pw = String(pw || "");
+  return pw.length >= 8 && pw.length <= 64 && !/\s/.test(pw)
+    && /[A-Za-z]/.test(pw) && /[0-9]/.test(pw) && /[^A-Za-z0-9]/.test(pw);
+}
+const PW_RULE_MSG = "비밀번호는 8자 이상, 영문·숫자·특수기호를 모두 포함해야 합니다.";
+
+// 타임어택 TOP10 : 각 유저의 개인 최고기록 필드에서 파생 (모드별로 필드가 다름).
+//  → 로그인 유저만 기록되고, 유저당 최고 1개만 랭크된다.
+//  연습코스는 각자 새 컬럼에 기록한다 : A-1~3=bestA1/A2/A3, B-1~3=bestB1/B2/B3.
+//  옛 기록(bestTime=자유, bestTimeHard=하드)은 건드리지 않고 그대로 보존한다.
+const RECORD_FIELD = { a1: "bestA1", a2: "bestA2", a3: "bestA3", racing: "bestB1", hard: "bestB2", serp: "bestB3", c1: "bestC1", c2: "bestC2", c3: "bestC3", d1: "bestD1", retro1: "bestTime", retro2: "bestTimeHard", boss: "bestBoss" };
+// 보스전 기록은 "오래 버틸수록" 좋은 내림차순 — 타임어택(오름차순)과 정렬이 반대
+const RECORD_DESC = { boss: true };
+function topRecordsList(field) {
+  const arr = [];
+  for (const id in users) {
+    const u = users[id];
+    if (u[field]) arr.push({ name: u.nickname, ms: u[field] });
+  }
+  arr.sort((a, b) => a.ms - b.ms);
+  return arr.slice(0, 10);
+}
+function broadcastRecords(mode) {
+  const field = RECORD_FIELD[mode];
+  if (!field) return;
+  const payload = JSON.stringify({ type: "topRecords", records: topRecordsList(field) });
+  for (const [, p] of players) {
+    if (p.active && p.mode === mode && p.ws.readyState === p.ws.OPEN) p.ws.send(payload);
+  }
+}
+
+// 토큰 : users.token 에 영속 저장 → 서버 재시작해도 자동 로그인 유지(세션 만료 없음).
+const tokens = new Map(); // token -> userId (users 에서 복원)
+function rebuildTokens() {
+  tokens.clear();
+  for (const id in users) if (users[id].token) tokens.set(users[id].token, id);
+}
+
+// 로그인 확정 : p 에 계정 정보 부착 + authOk 통지
+function loginPlayer(p, userId) {
+  const u = users[userId];
+  if (!u) return;
+  if (!u.token) { u.token = crypto.randomBytes(16).toString("hex"); persistUser(userId); } // 영구 토큰
+  tokens.set(u.token, userId);
+  p.account = { userId, nickname: u.nickname, isAdmin: userId === ADMIN_ID };
+  p.isAdmin = p.account.isAdmin;
+  p.name = u.nickname;
+  p.loginAt = Date.now();
+  if (u.color) p.color = u.color; // 계정에 저장된 차 색 → 즉시 릴레이에 반영
+  u.lastLogin = Date.now(); // "마지막 접속" = 마지막 활동 시각(접속 순간)
+  persistUser(userId);
+  send(p, {
+    type: "authOk", id: userId, nickname: u.nickname, isAdmin: p.isAdmin,
+    token: u.token, proWins: u.proWins || 0, proPlays: u.proPlays || 0,
+    bestA1Ms: u.bestA1 || 0, bestA2Ms: u.bestA2 || 0, bestA3Ms: u.bestA3 || 0,
+    bestMs: u.bestB1 || 0, bestHardMs: u.bestB2 || 0, bestSerpMs: u.bestB3 || 0,
+    bestC1Ms: u.bestC1 || 0, bestC2Ms: u.bestC2 || 0, bestC3Ms: u.bestC3 || 0, bestD1Ms: u.bestD1 || 0, totalTime: liveTotalTime(p),
+    color: u.color || null, settings: u.settings || null, // 계정에 저장된 차 색 + 설정 복원
+    lastLogin: u.lastLogin, // 마지막 활동 시각
+    rankScore: rankScoreOf(u), rankAllowed: rankAllowedOf(u, userId), // 랭크전 점수/참가 허용
+    rankWins: u.rankWins || 0, rankPlays: u.rankPlays || 0,           // 랭크전 전적
+    casualWins: u.casualWins || 0, casualPlays: u.casualPlays || 0,   // 일반전 전적 (점수 없음)
+    gift: u.gift ? { msg: u.gift.msg } : null, // 미수령 이벤트 선물 → 접속 즉시 팝업
+    spaceSkin: !!u.spaceSkin, // 우주 스킨 소유 (수령 완료) — 소유자만 차고 스와치 표시
+    friendsCount: Array.isArray(u.friends) ? u.friends.length : 0, // 채팅 친구 탭 표시 여부
+    friendReqCount: Array.isArray(u.friendReqs) ? u.friendReqs.length : 0, // 친구 아이콘 배지
+  });
+  // 최근 친구 귓속말 재전송 (오프라인 동안 받은 것 포함) — authOk 다음에 보내 클라가 내 계정을 아는 상태로 처리
+  const dms = dmHistory[userId];
+  if (dms && dms.length) send(p, { type: "chatHistory", scope: "friends", messages: dms });
+  // 이 계정의 첫 접속이면 친구들에게 접속 알림 (두 번째 탭 로그인은 조용히)
+  if (connsOf(userId).length === 1) notifyFriendsPresence(userId, true);
+  // 칭호 : 연속 접속 갱신 → 재판정 → 오프라인 중 쌓인 수여 알림 전달
+  bumpStreak(u);
+  recomputeTitles(userId);
+  if (Array.isArray(u.titleNews) && u.titleNews.length) {
+    for (const k of u.titleNews) sendTitleGrant(p, k);
+    u.titleNews = [];
+    persistUser(userId);
+  }
+  sendStats(p); // 연속 접속/보유 칭호가 대시보드에 바로 보이게 (60초 주기 전에 1회)
+}
+
+// 접속 시간을 평생 누적(user.totalTime)에 반영하고 기준시각 리셋
+function flushConnectedTime(p) {
+  if (!p.account || !p.loginAt) return;
+  const u = users[p.account.userId];
+  if (!u) return;
+  u.totalTime = (u.totalTime || 0) + (Date.now() - p.loginAt);
+  p.loginAt = Date.now();
+  u.lastLogin = Date.now(); // "마지막 접속" = 마지막 활동 시각 : 접속 중이면 계속 최신으로 갱신
+  persistUser(p.account.userId);
+}
+
+// 현재 진행 중인 세션까지 포함한 "실시간 평생 접속 시간".
+//  클라는 이 값을 수신 시각 기준으로 라이브 증가시키므로 이중 계산이 없다.
+function liveTotalTime(p) {
+  if (!p.account) return 0;
+  const u = users[p.account.userId];
+  if (!u) return 0;
+  return (u.totalTime || 0) + (p.loginAt ? (Date.now() - p.loginAt) : 0);
+}
+
+// 통계(우승/플레이/최고기록/누적접속) 전송
+function sendStats(p) {
+  if (!p.account) return;
+  const u = users[p.account.userId];
+  if (!u) return;
+  send(p, { type: "stats", proWins: u.proWins || 0, proPlays: u.proPlays || 0, bestA1Ms: u.bestA1 || 0, bestA2Ms: u.bestA2 || 0, bestA3Ms: u.bestA3 || 0, bestMs: u.bestB1 || 0, bestHardMs: u.bestB2 || 0, bestSerpMs: u.bestB3 || 0, bestC1Ms: u.bestC1 || 0, bestC2Ms: u.bestC2 || 0, bestC3Ms: u.bestC3 || 0, bestD1Ms: u.bestD1 || 0, totalTime: liveTotalTime(p), lastLogin: u.lastLogin || 0, rankScore: rankScoreOf(u), rankAllowed: rankAllowedOf(u, p.account.userId), rankWins: u.rankWins || 0, rankPlays: u.rankPlays || 0, casualWins: u.casualWins || 0, casualPlays: u.casualPlays || 0, streakDays: u.streakDays || 0, titlesCount: Array.isArray(u.titles) ? u.titles.length : 0 });
+}
+
+// --- 정적 파일 서버 (client/dist) -------------------------------------------
+const MIME = {
+  ".html": "text/html; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".mjs": "application/javascript; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".ico": "image/x-icon",
+  ".woff2": "font/woff2",
+  ".webmanifest": "application/manifest+json",
+  ".json": "application/json; charset=utf-8",
+};
+
+// 클라이언트는 별도 repo(carparty-client)다. 예전처럼 서버가 js 를 손으로
+// 이어붙이지 않고, 그쪽 Vite 가 엔진·시뮬·React 를 한 번에 번들한다.
+//  - 한 호스트로 운영 : 클라에서 `npm run build` 한 dist 를 여기서 정적 서빙.
+//  - 클라를 정적 호스팅에 분리 : dist 가 없어도 되고 이 서버는 WebSocket 만 맡는다.
+//  - 개발 : Vite 개발 서버(:5173)가 HMR 로 띄우고 /ws 를 이 서버로 프록시한다.
+const DIST = PATHS.CLIENT_DIST;
+const hasDist = fs.existsSync(path.join(DIST, "index.html"));
+if (!hasDist) {
+  console.warn(
+    `[static] ${DIST} 에 빌드 결과가 없습니다 — WebSocket 전용으로 동작합니다.\n` +
+    `         한 호스트에서 같이 서빙하려면 carparty-client 에서 'npm run build' 하거나,\n` +
+    `         CLIENT_DIST 로 빌드 경로를 지정하세요.`
+  );
+}
+
+// 해시가 붙은 Vite 산출물(assets/)은 영구 캐시, 나머지는 매번 재검증.
+function cacheControl(urlPath) {
+  return urlPath.startsWith("/assets/")
+    ? "public, max-age=31536000, immutable"
+    : "no-cache";
+}
+
+const server = http.createServer((req, res) => {
+  const urlPath = req.url === "/" ? "/index.html" : req.url.split("?")[0];
+
+  // 헬스체크 : 클라이언트 빌드 없이 WebSocket 전용으로 돌 때도 200 이어야 한다.
+  //  (그 경우 "/" 는 서빙할 index.html 이 없어 404 다 — 배포 헬스체크는 이 경로로)
+  if (urlPath === "/healthz") {
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    return res.end(JSON.stringify({ ok: true, players: players.size, dist: hasDist }));
+  }
+
+  const filePath = path.join(DIST, path.normalize(urlPath));
+
+  // 디렉터리 탈출 방지
+  if (!filePath.startsWith(DIST)) {
+    res.writeHead(403);
+    return res.end("Forbidden");
+  }
+
+  fs.readFile(filePath, (err, data) => {
+    if (err) {
+      // SPA 폴백 : 확장자 없는 경로는 index.html 로 넘겨 클라이언트 라우팅에 맡긴다.
+      if (!path.extname(urlPath)) {
+        return fs.readFile(path.join(DIST, "index.html"), (e2, html) => {
+          if (e2) { res.writeHead(404); return res.end("Not found"); }
+          res.writeHead(200, { "Content-Type": MIME[".html"], "Cache-Control": "no-cache" });
+          res.end(html);
+        });
+      }
+      res.writeHead(404);
+      return res.end("Not found");
+    }
+    const ext = path.extname(filePath);
+    res.writeHead(200, {
+      "Content-Type": MIME[ext] || "application/octet-stream",
+      "Cache-Control": cacheControl(urlPath),
+    });
+    res.end(data);
+  });
+});
+
+/* =============================================================================
+ *  바이너리 프로토콜 — 고빈도 메시지만 바이너리(빅엔디언), 나머지는 JSON.
+ * -----------------------------------------------------------------------------
+ *  v4 의 와이어에는 두 종류뿐이다 : MSG_INPUT(클라→서버 입력) / MSG_SNAP4(서버→클라
+ *  권위 스냅샷). 둘 다 아래 "넷코드 v4" 절에서 정의한다.
+ *  구 state 디코딩(decodeState) · 스냅샷 v2/v3 인코딩(encodeSnapshot) · applyState 는
+ *  폐지됐다 — 위치는 서버 시뮬이 권위라 클라가 보낼 좌표 자체가 없다.
+ *  chat/auth/room/race 등 저빈도 메시지는 전부 JSON 이다.
+ * ========================================================================== */
+// 구(v2/v3) 클라이언트의 위치 스트리밍 프레임. 이제 "낡은 클라 감지" 용도로만 남아 있다
+//  → 받으면 kicked{update} 로 새로고침을 유도한다 (수신부는 wss.on("connection") 참고).
+const MSG_STATE = 1;
+const A2I = 32767 / Math.PI; // 각도 ↔ int16 스케일
+const clampI16 = (v) => (v < -32768 ? -32768 : v > 32767 ? 32767 : v);
+const normAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+function hexToRgb(hex) { if (typeof hex !== "string" || hex[0] !== "#" || hex.length < 7) return [232, 96, 76]; const n = parseInt(hex.slice(1, 7), 16); if (!Number.isFinite(n)) return [232, 96, 76]; return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+
+/* =============================================================================
+ *  넷코드 v4 — 서버 권위 시뮬레이션 (NETCODE.md)
+ * -----------------------------------------------------------------------------
+ *  클라는 "입력"만 보낸다(MSG_INPUT=4). 서버가 60Hz 고정틱으로 전 차량을
+ *  @carparty/sim 시뮬로 적분하고, 그룹 정본 스냅샷(MSG_SNAP4=5)을 내려보낸다.
+ *  구(v2/v3) 클라이언트의 바이너리 state 는 kicked{update} 로 새로고침 유도.
+ * ========================================================================== */
+const MSG_INPUT = 4, MSG_SNAP4 = 5;
+const MAX_LEAD_TICKS = 24;        // 수용 입력 틱 상한 (클라 lead 최대 20 + 지터 여유)
+const INPUT_RING_MAX = 32;        // 인당 입력 버퍼 상한
+const STARVE_COAST_TICKS = 5;     // 이 이상 결손 → 중립 입력(코스트)
+const STARVE_FREEZE_TICKS = 45;   // 이 이상 결손 → 하드 프리즈 + 판정 제외
+const KEYFRAME_TICKS = 120;       // 2초마다 그룹 키프레임(이름/색 포함)
+const BACKPRESSURE_SKIP = 64 * 1024, BACKPRESSURE_KILL = 1024 * 1024;
+const RESTART_CD_TICKS = 60;      // R(출발선 복귀) 쿨다운
+
+let serverTick = 0;
+
+// 차대차 충돌 활성 모드 (NETCODE.md §9 매트릭스). 프로는 레이스 중에만.
+const COLLIDE_MODES = new Set(["plaza", "survival", "sumo", "boss"]);
+function groupCollides(key, g) {
+  if (key.startsWith("room:")) { // 프로 방 : 레이스 중에만 몸싸움
+    const rid = Number(key.slice(5));
+    const room = rooms.get(rid);
+    return !!(room && room.state === "racing");
+  }
+  return COLLIDE_MODES.has(key.slice(5)); // "mode:" 접두
+}
+const groupContacts = new Map(); // groupKey -> Map(pairId -> {nx,ny,tick}) : 접촉 법선 히스테리시스
+
+// 모드별 시뮬 환경 (트랙/장애물/경계) — 순수 데이터, 1회 구성
+const MODE_ENV = {};
+for (const m of ["a1", "a2", "a3", "racing", "hard", "serp", "c1", "c2", "c3", "d1", "retro1", "retro2", "test"]) {
+  MODE_ENV[m] = { world: SIM.WORLD_DIMS[m], track: TRACKS[m], obstacles: null, speedScale: 1, noBounds: false };
+}
+MODE_ENV.survival = { world: { w: MAP_SIZE, h: MAP_SIZE }, track: null, obstacles: null, speedScale: 1, noBounds: false };
+MODE_ENV.plaza = { world: SIM.WORLD_DIMS.plaza, track: null, obstacles: SIM.PLAZA_OBSTACLES, speedScale: 1, noBounds: false };
+MODE_ENV.boss = { world: SIM.WORLD_DIMS.boss, track: null, obstacles: SIM.BOSS_PILLARS, speedScale: 1, noBounds: false };
+MODE_ENV.sumo = { world: SIM.WORLD_DIMS.sumo, track: null, obstacles: null, speedScale: SIM.SUMO.speedScale, noBounds: true };
+function envForPlayer(p) {
+  if (p.mode === "pro") {
+    const room = p.roomId != null ? rooms.get(p.roomId) : null;
+    const track = room ? TRACKS.pro[room.trackIndex % TRACKS.pro.length] : TRACKS.pro[0];
+    return { world: SIM.WORLD_DIMS.pro, track, obstacles: null, speedScale: 1, noBounds: false };
+  }
+  return MODE_ENV[p.mode] || MODE_ENV.survival;
+}
+
+// v4 플레이어 초기화 (join 시). p.state 는 p.sim 을 가리켜 기존 판정 코드가 그대로 동작한다.
+function simInit(p) {
+  if (!p.sim) p.sim = SIM.makeCarState(0, 0, 0);
+  p.state = p.sim;
+  p.inputBuf = new Map();
+  p.lastConsumedTick = serverTick;
+  p.curButtons = 0; p.prevButtons = 0;
+  p.starve = 0; p.starved = false;
+  p.needKeyframe = true;
+  p.phase = 0;
+  p.hist = [];
+  p.sumoOutTicks = 0;
+  p.restartReadyTick = 0;
+  p.lapGate = { checkpoint: false, lastPhase: 0 };
+}
+
+/* 텔레포트 직전까지 도착해 있던 입력은 "이전 타임라인"의 것 — TCP 순서 보장으로
+ *  이 시점의 버퍼 내용물은 전부 텔레포트 원인(재시작/스폰) 이전에 보낸 입력이다.
+ *  그대로 소비하면 순간이동 직후 차가 저절로 굴러간다(주행 중 R 버그의 원인). */
+function flushInputs(p) {
+  if (p.inputBuf) p.inputBuf.clear();
+  p.curButtons = 0; p.prevButtons = 0;
+  p.lastSeenTick = 0; p.lastSeenButtons = 0; // 이전 타임라인 관측 키도 폐기
+}
+
+// 스폰/배치 : 시뮬 순간이동 + 판정 상태 리셋 + 클라 통지(클라도 같은 좌표로 예측 리셋)
+function spawnSim(p, x, y, angle, invulnMs) {
+  if (!p.sim) simInit(p);
+  flushInputs(p); // 이전 타임라인 입력 폐기 — 스폰 직후 유령 주행 방지
+  SIM.teleport(p.sim, x, y, angle);
+  p.state = p.sim;
+  p.prevHead = headOf(p.sim);
+  if (invulnMs) p.invulnUntil = Date.now() + invulnMs;
+  p.needKeyframe = true;
+  send(p, { type: "spawn", x, y, angle, tick: serverTick });
+}
+
+// --- MSG_INPUT 수신 ---------------------------------------------------------
+function handleInputFrame(p, buf) {
+  if (!p.inputBuf) return; // 미입장(시뮬 미생성) — 입장 후 입력만 유효
+  // 아래 검사들은 "이 프레임만 버린다". 예전엔 위반을 누적해 300회에서 추방했으나,
+  // 카운터가 세션 내내 감쇠 없이 쌓여 랙/탭전환뿐인 정상 플레이어도 오래 붙어 있으면
+  // 튕기는 오탐이 있었다(서버 권위 시뮬이라 조작 자체는 이미 불가) → 추방 제거.
+  if (buf.length < 11 || buf.length > 128) return;
+  p.ackSnapTick = buf.readUInt32BE(1);
+  const count = buf.readUInt8(5);
+  if (count < 1 || count > 16 || buf.length < 6 + count * 5) return;
+  // 입력 레이트리밋 : 정상 상한은 60fps x 6레코드(중복 동봉) = 360/s — 600/s 초과분은 조용히 버린다.
+  const now = Date.now();
+  if (!p.inRate || now - p.inRate.t > 1000) p.inRate = { t: now, n: 0 };
+  p.inRate.n += count;
+  if (p.inRate.n > 600) return;
+  let o = 6;
+  for (let i = 0; i < count; i++) {
+    const tick = buf.readUInt32BE(o); o += 4;
+    const buttons = buf.readUInt8(o); o += 1;
+    // 최신 "관측" 키 상태 — 지각-폐기되는 레코드라도 키 상태 자체는 진짜다.
+    // 기아 시 코스트(키 놓음) 대신 이걸 유지해 클라 예측(계속 달림)과 맞춘다.
+    if (tick > (p.lastSeenTick || 0)) { p.lastSeenTick = tick; p.lastSeenButtons = buttons; }
+    // 수용 창 : (마지막 소화 틱, serverTick + MAX_LEAD]. 중복은 최초값 유지(사후 수정 불가).
+    if (tick <= (p.lastConsumedTick || 0) || tick > serverTick + MAX_LEAD_TICKS) continue;
+    if (!p.inputBuf.has(tick)) {
+      if (p.inputBuf.size >= INPUT_RING_MAX) return; // 링 포화 : 남은 기록만 버린다
+      p.inputBuf.set(tick, buttons);
+      // 도착 위상 : 이 입력이 시뮬보다 몇 틱 여유/지각인지 → 클라 lead 적응 신호
+      p.phase = (serverTick + 1) - tick; // 음수 = 여유(정상), 양수 = 지각
+    }
+  }
+}
+
+// 틱마다 이 플레이어의 입력을 하나 소화 (없으면 기아 상태머신)
+function consumeInput(p) {
+  const want = serverTick;
+  const b = p.inputBuf.get(want);
+  if (b !== undefined) {
+    p.inputBuf.delete(want);
+    p.lastConsumedTick = want;
+    p.prevButtons = p.curButtons;
+    p.curButtons = b;
+    p.starve = 0; p.starved = false;
+  } else {
+    p.starve++;
+    p.prevButtons = p.curButtons;
+    if (p.starve > STARVE_COAST_TICKS) {
+      // 최근(45틱 내) 관측된 키가 있으면 유지 — 프레임 스톨/업링크 버스트 동안
+      // 서버 차가 멈춰 "복귀" 갭을 만드는 대신 클라 예측처럼 이어 달린다.
+      p.curButtons = (p.lastSeenTick && serverTick - p.lastSeenTick < STARVE_FREEZE_TICKS)
+        ? p.lastSeenButtons : 0;
+    }
+    if (p.starve > STARVE_FREEZE_TICKS) p.starved = true;     // 프리즈 + 판정 제외
+  }
+  // 과거 틱 입력 청소 (지각 도착분)
+  if (p.inputBuf.size) for (const t of p.inputBuf.keys()) if (t < want) p.inputBuf.delete(t);
+  return p.curButtons;
+}
+
+// --- MSG_SNAP4 인코딩 -------------------------------------------------------
+//  그룹 본문 1회 인코딩 + 클라별 11B 헤더. 키프레임(2s/입장)엔 이름/색 포함.
+const FULL_MASK = 0x7ff; // bit9 driftBoostT, bit10 slideTicks (임팩트 슬라이드 잔여 — 완전 상태 복원)
+function entityBytes(e, keyframe) {
+  let n = 4 + 2 + 8 + 8 + 2 + 1 + 1 + 1 + 3 + 2 + 1 + 1; // id+mask+pos+vel/ev+angle+steer+buttons+state+timers+spin+driftBoostT+slideTicks
+  if (keyframe) n += 3 + 1 + e.nameBuf.length;
+  return n;
+}
+function encodeGroupBody(entries, keyframe) {
+  let size = 2;
+  for (const e of entries) size += entityBytes(e, keyframe);
+  const buf = Buffer.allocUnsafe(size);
+  let o = 0;
+  buf.writeUInt16BE(entries.length, o); o += 2;
+  for (const e of entries) {
+    const s = e.s;
+    buf.writeUInt32BE(e.id >>> 0, o); o += 4;
+    buf.writeUInt16BE(FULL_MASK, o); o += 2;
+    buf.writeInt32BE(Math.round(s.x * 4), o); o += 4;
+    buf.writeInt32BE(Math.round(s.y * 4), o); o += 4;
+    buf.writeInt16BE(clampI16(Math.round(s.vx * 8)), o); o += 2;
+    buf.writeInt16BE(clampI16(Math.round(s.vy * 8)), o); o += 2;
+    buf.writeInt16BE(clampI16(Math.round(s.evx * 8)), o); o += 2;
+    buf.writeInt16BE(clampI16(Math.round(s.evy * 8)), o); o += 2;
+    buf.writeInt16BE(Math.round(normAngle(s.angle) * A2I), o); o += 2;
+    buf.writeInt8(Math.round(SIM.clamp(s.steerInput, -1, 1) * 127), o); o += 1;
+    buf.writeUInt8(e.buttons & 255, o); o += 1;
+    buf.writeUInt8(e.stateByte & 255, o); o += 1;
+    buf.writeUInt8(Math.min(255, e.invulnTicks | 0), o); o += 1;
+    buf.writeUInt8(Math.min(255, Math.max(0, (s.lockUntilTick - serverTick) | 0)), o); o += 1;
+    buf.writeUInt8(Math.min(255, Math.max(0, (s.stunUntilTick - serverTick) | 0)), o); o += 1;
+    buf.writeInt16BE(clampI16(Math.round(s.spinV * 8)), o); o += 2;
+    buf.writeUInt8(Math.round(SIM.clamp(s.driftBoostT || 0, 0, 1) * 255), o); o += 1;
+    buf.writeUInt8(Math.min(255, Math.max(0, (s.impactSlideUntilTick - serverTick) | 0)), o); o += 1;
+    if (keyframe) {
+      const [r, g, b] = hexToRgb(e.color);
+      buf.writeUInt8(r, o); buf.writeUInt8(g, o + 1); buf.writeUInt8(b, o + 2); o += 3;
+      buf.writeUInt8(e.nameBuf.length, o); o += 1;
+      e.nameBuf.copy(buf, o); o += e.nameBuf.length;
+    }
+  }
+  return buf;
+}
+function sendSnap(p, body, keyframe) {
+  const ws = p.ws;
+  if (ws.readyState !== ws.OPEN) return false;
+  if (ws.bufferedAmount > BACKPRESSURE_KILL) { kickPlayer(p, "네트워크 정체"); return false; }
+  if (ws.bufferedAmount > BACKPRESSURE_SKIP) { p.needKeyframe = true; return false; } // 정체 중 스킵 → 해소 후 키프레임
+  const head = Buffer.allocUnsafe(11);
+  head.writeUInt8(MSG_SNAP4, 0);
+  head.writeUInt32BE(serverTick >>> 0, 1);
+  head.writeUInt32BE((p.lastConsumedTick || 0) >>> 0, 5);
+  head.writeInt8(Math.max(-128, Math.min(127, p.phase | 0)), 9);
+  head.writeUInt8(keyframe ? 1 : 0, 10);
+  ws.send(Buffer.concat([head, body]));
+  return true;
+}
+
+/* R(출발선 복귀/기록 재시작) — TCP-신뢰 JSON 명령으로 수신해 즉시 실행하고
+ *  spawn{restart:true} 로 확정 응답한다. 입력 비트 방식은 중복 창(~33ms)을 넘는
+ *  지터 스파이크에서 통째로 유실돼 클라/서버 순간이동 불일치(셰이크 버그)를 만들었다. */
+function tryRestart(p) {
+  if (!p.active || !p.sim || !p.state) return;
+  const envDef = MODE_ENV[p.mode];
+  if (!envDef || !envDef.track) return;                    // 타임어택/테스트 모드만
+  if (serverTick < (p.restartReadyTick || 0)) return;      // 쿨다운(스팸 방지)
+  const st = SIM.placeBehindStart(envDef.track);
+  flushInputs(p); // 이전 타임라인 입력 폐기 — 재시작 직후 유령 주행 방지 (핵심)
+  SIM.teleport(p.sim, st.x, st.y, st.angle);
+  p.prevHead = headOf(p.sim);
+  p.restartReadyTick = serverTick + RESTART_CD_TICKS;
+  p.needKeyframe = true;
+  // 타임어택 계측 armed — 기록은 서버 시뮬로 산출(클라 제출 신뢰 안 함)
+  if (RECORD_FIELD[p.mode]) {
+    p.att = { state: 1, startTick: 0, checkpoint: false, lastPhase: p.sim.lastPhase01 || 0 };
+    taInputReset(p); // 출발 전 조작(정렬용 좌우 꺾기)이 통계에 섞이지 않게 여기서도 비운다
+  }
+  send(p, { type: "spawn", x: st.x, y: st.y, angle: st.angle, tick: serverTick, restart: true });
+}
+
+/* 타임어택 봇 판정 — 판정 로직과 임계값은 ta-input.js 에 모여 있다.
+ *  여기서는 "언제 세고 언제 묻는지"만 다룬다. */
+const TA_SUSPECT_FILE = PATHS.TA_SUSPECT_FILE;
+
+const taInputReset = (p) => { p.taIn = TA.create(); };
+const taInputTick = (p) => TA.tick(p.taIn, p.curButtons);
+const taInputVerdict = (p) => TA.verdict(p.taIn);
+
+/* 접속 중인 관리자에게만 보내는 시스템 알림 (공개 채팅엔 안 올라간다) */
+function notifyAdmins(text) {
+  const m = { type: "chat", id: 0, name: "시스템", text, t: Date.now() };
+  for (const [, q] of players) if (q.isAdmin) send(q, m);
+}
+
+function logTaSuspect(entry) {
+  fs.appendFile(TA_SUSPECT_FILE, JSON.stringify(entry) + "\n", (err) => {
+    if (err) console.error("[ta-suspect]", err.message);
+  });
+}
+
+/* 타임어택 기록 반영 — 서버 시뮬이 산출한 틱 수 기준 (기존 3s~10min·체류 검증 유지) */
+function submitTimeAttack(p, ms) {
+  const field = RECORD_FIELD[p.mode];
+  if (!p.active || !field || !p.account) return;
+  if (!Number.isFinite(ms) || ms < 3000 || ms > 600000) return;
+  const now = Date.now();
+  if (now - (p.taModeSince || now) < ms * 0.7) return; // 벽시계 체류보다 짧은 기록 = 이상
+  const u = users[p.account.userId];
+  if (!u) return;
+  if (u[field] && Math.floor(ms) >= u[field]) return;  // 자기 기록 못 넘었으면 아무 일 없음
+
+  // 입력 계측 판정 — 갱신되는 기록에 대해서만 본다 (평범한 주행은 셀 이유가 없다)
+  const iv = taInputVerdict(p);
+  if (iv.verdict !== "ok") {
+    logTaSuspect({ t: now, uid: p.account.userId, name: p.account.nickname, mode: p.mode, ms: Math.floor(ms), ...iv });
+    const label = `${p.account.nickname}(${p.account.userId}) ${p.mode} ${(ms / 1000).toFixed(2)}s`;
+    const stat = `전환 ${iv.flipRate}/s · 플릭 ${(iv.flickFrac * 100).toFixed(0)}% · 1틱 ${iv.hold1}`;
+    if (iv.verdict === "impossible") {
+      notifyAdmins(`[봇 의심·기록 반려] ${label} — ${stat}`);
+      send(p, { type: "chat", id: 0, name: "시스템", text: "비정상 입력이 감지되어 이번 기록은 저장되지 않았습니다.", t: now });
+      return; // 사람 손으로 낼 수 없는 값 → 저장하지 않는다
+    }
+    notifyAdmins(`[봇 의심·기록 저장됨] ${label} — ${stat}`);
+  }
+
+  u[field] = Math.floor(ms);
+  persistUser(p.account.userId);
+  sendStats(p);
+  broadcastRecords(p.mode);
+  recomputeAllTitles();
+}
+
+/* --- 통합 60Hz 틱 루프 ------------------------------------------------------
+ *  입력 소화 → 그룹 시뮬 → 규칙 판정(킬/펀치/링아웃/랩) → 스냅샷.
+ *  hrtime 기반 드리프트 보정, 캐치업 상한 6틱(스톨 → 히치 선언 + 키프레임). */
+const TICK_NS = BigInt(Math.round(1e9 / SIM.TICK_RATE));
+let tickBase = process.hrtime.bigint();
+let tickCount = 0n;
+
+function doTick() {
+  serverTick++;
+  const now = Date.now();
+
+  // 1) 그룹 구성 (기존 브로드캐스트와 동일한 가시성 규칙)
+  const groups = new Map(); // key -> { list: [{id,p}], env }
+  for (const [id, p] of players) {
+    if (!p.active || !p.sim || !p.state || (p.mode === "boss" && p.bossSpec)) {
+      // 그룹 밖(관전/사망 대기)에서도 입력 링은 소화한다 — 클라는 계속 보내므로
+      // 소화가 멈추면 32슬롯 링이 넘쳐 이후 입력이 통째로 버려진다.
+      if (p.inputBuf) consumeInput(p);
+      continue;
+    }
+    const key = p.mode === "pro" ? (p.roomId != null ? "room:" + p.roomId : "pro:none") : "mode:" + p.mode;
+    let g = groups.get(key);
+    if (!g) { g = { list: [], env: null }; groups.set(key, g); }
+    g.list.push({ id, p });
+  }
+
+  // 2) 입력 소화 + 시뮬
+  for (const [key, g] of groups) {
+    const entries = [];
+    for (const { id, p } of g.list) {
+      const buttons = consumeInput(p);
+      const env = envForPlayer(p);
+      const freeze =
+        p.starved
+        || (p.mode === "pro" && (() => {
+              const r = p.roomId != null ? rooms.get(p.roomId) : null;
+              if (!r) return true;
+              if (r.state === "racing") return false;
+              // 카운트다운 : 계획된 시작 틱부터 해제 — 클라 raceFrozen() 과 같은 시계
+              return !(r.state === "countdown" && r.startTick && serverTick >= r.startTick);
+            })())
+        || (p.mode === "boss" && (p.bossDeadUntil > now || p.bossSpec));
+      entries.push({
+        id, s: p.sim, buttons: freeze ? 0 : buttons,
+        env: { tick: serverTick, world: env.world, track: env.track, obstacles: env.obstacles, speedScale: env.speedScale, noBounds: env.noBounds, freeze },
+      });
+    }
+    if (!entries.length) continue;
+    const groupEnv = entries[0].env;
+    const collide = groupCollides(key, g) && entries.length >= 2;
+    let contacts = null;
+    if (collide) {
+      contacts = groupContacts.get(key);
+      if (!contacts) { contacts = new Map(); groupContacts.set(key, contacts); }
+      for (const e of entries) e.s.noCollide = e.env.freeze || undefined; // 기아 프리즈/대기 차는 유령
+    }
+    SIM.stepGroup(entries, groupEnv, { collide, impulseScale: 1, contacts });
+    g.entries = entries;
+  }
+
+  // 3) 규칙 판정
+  for (const [, g] of groups) {
+    for (const { id, p } of g.list) {
+      // 위치 히스토리 (랙 보상 되감기)
+      if (!p.hist) p.hist = [];
+      p.hist.push({ t: now, x: p.sim.x, y: p.sim.y, angle: p.sim.angle });
+      while (p.hist.length > 2 && p.hist[0].t < now - 400) p.hist.shift();
+
+      // 타임어택 : 서버 권위 계측 (클라와 같은 attackStep — 표시만 클라 로컬)
+      if (p.att && p.att.state) {
+        const ev = SIM.attackStep(p.att, p.sim, serverTick);
+        if (ev && ev.k === "start") taInputReset(p);   // 계측 시작 = 입력 통계도 여기서부터
+        if (p.att.state === 2) taInputTick(p);         // 달리는 동안의 조향 입력만 센다
+        if (ev && ev.k === "finish") submitTimeAttack(p, SIM.ticksToMs(ev.ticks));
+      }
+
+      // 스모 링아웃 : 서버 판정 (클라 자가신고 sumoDead 폐지)
+      if (p.mode === "sumo" && !p.starved) {
+        const d = Math.hypot(p.sim.x - SUMO_CX, p.sim.y - SUMO_CY);
+        if (d > SUMO_RING_R && now >= (p.invulnUntil || 0)) {
+          p.sumoOutTicks = (p.sumoOutTicks || 0) + 1;
+          if (p.sumoOutTicks >= SIM.SUMO.outTicks) {
+            p.sumoOutTicks = 0;
+            broadcastMode("sumo", { type: "killed", victimId: id, killerId: 0, x: p.sim.x, y: p.sim.y });
+            const spawn = pickSumoSpawn(id);
+            spawnSim(p, spawn.x, spawn.y, spawn.angle, INVULN_MS);
+            p.graceUntil = now + GRACE_MS;
+            p.punchStart = 0; p.punchHit = false;
+          }
+        } else p.sumoOutTicks = 0;
+      }
+
+      // 프로 레이싱 랩 게이트 (서버 시뮬 진행도 기반)
+      if (p.mode === "pro" && p.roomId != null) {
+        const room = rooms.get(p.roomId);
+        if (room && room.state === "racing" && !p.finished) {
+          const ph = p.sim.lastPhase01 || 0;
+          if (SIM.lapGate(p.lapGate, ph) && (now - (p.lastLapT || 0)) >= MIN_LAP_MS) {
+            p.lap += 1; p.lastLapT = now;
+            // 순위판 기록 : "랩을 넘긴 그 순간"의 누적 시간으로 고정한다(랩마다 1회만 갱신).
+            //  예전엔 매 틱 now-raceStartAt 로 덮어써서 순위판 숫자가 라이브로 흘렀다 —
+            //  기록이 아니라 스톱워치로 보이는 버그(넷코드 v4 재작성 때 클라측 고정이 유실됨).
+            p.lapMs = now - room.raceStartAt;
+            if (p.lap >= room.laps) {
+              p.finished = true; p.finishTime = now;
+              const cand = now + END_TIMER_MS;
+              room.raceEndAt = room.raceEndAt > 0 ? Math.min(room.raceEndAt, cand) : cand;
+              broadcastRoom(p.roomId);
+            }
+          }
+          p.prog = Math.max(p.lap, Math.min(p.lap + 1, p.lap + ph));
+        }
+      }
+    }
+  }
+  runCollisions();  // 서바이벌 헤드킬 (시뮬 상태 기반)
+  sumoTick();       // 스모 펀치 히트 (시뮬 상태 기반)
+
+  // 4) 스냅샷 전송 — 그룹 본문 1회 인코딩 + 클라별 헤더
+  const keyAll = serverTick % KEYFRAME_TICKS === 0;
+  for (const [key, g] of groups) {
+    const list = g.list;
+    // 엔트리 메타 (state byte / 이름 / 색)
+    const encEntries = [];
+    // 보스 엔티티 (id 0, ballistic 외삽)
+    if (key === "mode:boss" && bossWorld.boss && bossWorld.state !== "idle") {
+      const b = bossWorld.boss;
+      encEntries.push({
+        id: BOSS_ID, s: {
+          x: b.x, y: b.y, vx: b.vx || 0, vy: b.vy || 0, evx: 0, evy: 0,
+          angle: b.angle, steerInput: 0, spinV: 0, lockUntilTick: 0, stunUntilTick: 0,
+        },
+        buttons: 0, stateByte: 1 << 5, invulnTicks: 0,
+        color: "#101010", nameBuf: Buffer.alloc(0),
+      });
+    }
+    let needKey = keyAll;
+    for (const { id, p } of g.list) if (p.needKeyframe) needKey = true;
+    if (key === "mode:boss") { // 관전자(그룹 밖 수신자)의 키프레임 필요도 반영
+      for (const [, p] of players) if (p.active && p.mode === "boss" && p.bossSpec && p.needKeyframe) needKey = true;
+    }
+    for (const { id, p } of g.list) {
+      const room = p.mode === "pro" && p.roomId != null ? rooms.get(p.roomId) : null;
+      const anon = room && rankAnon(room);
+      const invulnMs = Math.max(0, (p.invulnUntil || 0) - now);
+      const extrap = p.starved ? 2 : 0; // 기아 프리즈 = static
+      encEntries.push({
+        id, s: p.sim, buttons: p.curButtons || 0,
+        stateByte: (p.sim.drifting ? 1 : 0)
+          | (invulnMs > 0 ? 2 : 0)
+          | (!anon && p.isAdmin ? 4 : 0)
+          | (p.starved ? 8 : 0)
+          | ((p.sim.contactTick === serverTick ? 1 : 0) << 4)
+          | (extrap << 5)
+          | (serverTick < p.sim.lockUntilTick ? 128 : 0),
+        invulnTicks: Math.ceil(invulnMs / SIM.TICK_MS),
+        color: anon ? RANK_ANON_COLOR : p.color,
+        nameBuf: Buffer.from(anon ? "???" : (p.name || ""), "utf8").subarray(0, 60),
+      });
+    }
+    const body = encodeGroupBody(encEntries, needKey);
+    for (const { p } of g.list) {
+      const sent = sendSnap(p, body, needKey);
+      if (needKey && sent) p.needKeyframe = false; // 백프레셔 스킵이면 플래그 유지(소실 방지)
+    }
+    g.body = body; g.bodyKey = needKey;
+  }
+  // 보스 관전자 : 그룹 명단엔 없지만 보스 모드 스냅샷은 받아야 화면이 산다
+  const bossG = groups.get("mode:boss");
+  if (bossG && bossG.body) {
+    for (const [, p] of players) {
+      if (p.active && p.mode === "boss" && p.bossSpec) {
+        const sent = sendSnap(p, bossG.body, bossG.bodyKey);
+        if (bossG.bodyKey && sent) p.needKeyframe = false;
+      }
+    }
+  }
+  // 접촉 히스테리시스 맵 청소 (오래된 페어/사라진 그룹)
+  if (serverTick % 300 === 0) {
+    for (const [key, m] of groupContacts) {
+      if (!groups.has(key)) { groupContacts.delete(key); continue; }
+      for (const [pid, c] of m) if (serverTick - c.tick > 60) m.delete(pid);
+    }
+  }
+}
+
+function simLoop() {
+  const nowNs = process.hrtime.bigint();
+  let due = Number((nowNs - tickBase) / TICK_NS - tickCount);
+  if (due > 6) { // 이벤트루프 스톨 → 히치 : 밀린 틱을 버리고 시간 재정렬 + 전원 키프레임
+    tickBase = nowNs - (tickCount + 1n) * TICK_NS;
+    due = 1;
+    for (const [, p] of players) if (p.active) p.needKeyframe = true;
+  }
+  for (let i = 0; i < due; i++) { tickCount++; doTick(); }
+  const nextNs = tickBase + (tickCount + 1n) * TICK_NS;
+  const delayMs = Number(nextNs - process.hrtime.bigint()) / 1e6;
+  setTimeout(simLoop, Math.max(0, delayMs));
+}
+
+// --- WebSocket 서버 ---------------------------------------------------------
+const wss = new WebSocketServer({ server });
+
+let nextId = 1;
+// id -> { ws, state, active, mode, name, invulnUntil, graceUntil, prevHead }
+//  active=false : 메뉴 화면(미입장). 스냅샷/판정에서 제외된다.
+const players = new Map();
+
+// 최근 채팅 보관 (새 접속자에게 즉시 전송)
+const CHAT_HISTORY_MAX = 50;
+const chatHistory = [];
+
+// 채팅 전체를 append-only 로그(JSONL)에 영구 저장 : 시간 t / 아이디 uid / 닉 name / 메시지 text / admin.
+//  인게임 채팅창은 최근 50개만 보여주지만, 이 파일엔 "몽땅" 남는다. → view-chat.js 로 열람.
+const CHAT_LOG_FILE = PATHS.CHAT_LOG_FILE;
+function logChat(p, name, text, t, admin) {
+  const entry = { t, uid: p.account ? p.account.userId : null, name, text, admin: !!admin };
+  fs.appendFile(CHAT_LOG_FILE, JSON.stringify(entry) + "\n", (err) => { if (err) console.error("[chat-log]", err.message); });
+}
+
+wss.on("connection", (ws) => {
+  const id = nextId++;
+  players.set(id, { ws, state: null, active: false, mode: "survival", name: "", roomId: null, account: null, isAdmin: false });
+
+  // heartbeat : 클라이언트가 살아있는지 추적 (프록시가 유휴 연결을 끊는 것 방지)
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+
+  // 접속한 클라이언트에게 자신의 id + 최근 채팅을 알려준다
+  ws.send(JSON.stringify({ type: "welcome", id, v: 4, tick: serverTick }));
+  if (chatHistory.length) ws.send(JSON.stringify({ type: "chatHistory", messages: chatHistory }));
+  console.log(`[+] player ${id} connected (total ${players.size})`);
+
+  ws.on("message", (raw, isBinary) => {
+    // 바이너리 프레임 = 고빈도 state (JSON 파싱 없이 바로 디코딩)
+    //  try/catch : 길이가 다른 구/신버전·손상 패킷이 프로세스를 죽이지 않게 방어
+    if (isBinary) {
+      try {
+        const pb = players.get(id);
+        if (!pb) return;
+        if (raw.length >= 6 && raw[0] === MSG_INPUT) handleInputFrame(pb, raw);
+        else if (raw.length >= 15 && raw[0] === MSG_STATE) {
+          // 구(v2/v3) 클라이언트 : 위치 스트리밍은 폐지됐다 → 새 클라로 새로고침 유도
+          if (!pb.updateKicked) { pb.updateKicked = true; kickPlayer(pb, "update"); }
+        }
+      } catch (e) { /* 손상/버전 불일치 패킷 폐기 */ }
+      return;
+    }
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    const p = players.get(id);
+    if (!p) return;
+
+    if (msg.type === "hello") {
+      // v4 핸드셰이크. 구버전은 kicked{update} 로 처리되므로 여기선 버전만 기록.
+      p.protoV = Number(msg.v) || 4;
+      return;
+
+    } else if (msg.type === "ping") {
+      // 시계 동기 : 즉시 에코 (c = 클라 송신 시각)
+      send(p, { type: "pong", c: msg.c, tick: serverTick });
+      return;
+
+    } else if (msg.type === "setColor") {
+      // v4 : 차 색은 입력 패킷에 실리지 않는다 → 명시 메시지로 변경(검증 포함)
+      const ok = sanitizeColor(p, msg.color);
+      if (ok) { p.color = ok; p.needKeyframe = true; }
+      return;
+
+    } else if (msg.type === "signup") {
+      const idv = (msg.id || "").trim();
+      if (!/^[A-Za-z0-9_]{3,20}$/.test(idv)) { send(p, { type: "authError", reason: "아이디는 영문/숫자 3~20자여야 합니다." }); return; }
+      if (users[idv]) { send(p, { type: "authError", reason: "이미 존재하는 아이디입니다." }); return; }
+      // 비번 정책은 원문을 볼 수 있을 때만 서버가 검사할 수 있다(구버전 클라).
+      //  해시만 받는 신버전에서는 클라가 같은 규칙으로 검사한다 — 규칙을 우회해도 손해는 본인 계정뿐.
+      if (msg.password != null && !validPassword(msg.password)) { send(p, { type: "authError", reason: PW_RULE_MSG }); return; }
+      const pwh = credOf(idv, msg.pwh, msg.password);
+      if (!pwh) { send(p, { type: "authError", reason: PW_RULE_MSG }); return; }
+      // 닉네임 : 빈 값 금지 + 계정 간 중복 금지 (대소문자 무시. 게스트 이름은 제한 없음)
+      //  sanitizeName 은 빈 입력을 "Player" 로 바꾸므로, 빈 값 검사는 원본 입력으로 한다
+      if (!String(msg.nickname || "").trim()) { send(p, { type: "authError", reason: "닉네임을 입력하세요." }); return; }
+      const nick = sanitizeName(msg.nickname);
+      const nickTaken = Object.values(users).some((u) => (u.nickname || "").toLowerCase() === nick.toLowerCase());
+      if (nickTaken) { send(p, { type: "authError", reason: "이미 사용 중인 닉네임입니다." }); return; }
+      if (!authAllow(p)) { send(p, { type: "authError", reason: "시도가 너무 잦습니다. 잠시 후 다시 시도하세요." }); return; }
+      const nu = { id: idv, nickname: nick, proWins: 0, proPlays: 0 };
+      setPassword(nu, pwh, (ok) => {
+        if (!authDone(p)) return;
+        if (!ok) { send(p, { type: "authError", reason: "가입 처리에 실패했습니다. 다시 시도하세요." }); return; }
+        if (users[idv]) { send(p, { type: "authError", reason: "이미 존재하는 아이디입니다." }); return; } // 해싱하는 사이 선점된 경우
+        users[idv] = nu;
+        persistUser(idv);
+        loginPlayer(p, idv);
+      });
+      return;
+
+    } else if (msg.type === "login") {
+      const idv = (msg.id || "").trim();
+      const u = users[idv];
+      const bad = () => send(p, { type: "authError", reason: "아이디 또는 비밀번호가 틀렸습니다." });
+      if (!u) { bad(); return; }
+      if (!authAllow(p)) { send(p, { type: "authError", reason: "시도가 너무 잦습니다. 잠시 후 다시 시도하세요." }); return; }
+      verifyPassword(idv, u, msg, (ok, upgradePwh) => {
+        if (!authDone(p)) return;
+        if (!ok || users[idv] !== u) { bad(); return; }
+        if (u.banned) { send(p, { type: "authError", reason: "차단된 계정입니다." }); return; }
+        // 구 형식(평문 / scrypt(원문)) 계정은 로그인 성공 시 최신 형식으로 이관
+        if (upgradePwh) { setPassword(u, upgradePwh, (done) => { if (done) persistUser(idv); if (wsOpen(p)) loginPlayer(p, idv); }); return; }
+        loginPlayer(p, idv);
+      });
+      return;
+
+    } else if (msg.type === "auth") {
+      const uid = tokens.get(msg.token);
+      if (uid && users[uid] && !users[uid].banned) loginPlayer(p, uid);
+      else send(p, { type: "authError", reason: "", silent: true }); // 토큰 만료/차단 → 조용히 (게스트로 진행)
+      return;
+
+    } else if (msg.type === "logout") {
+      flushConnectedTime(p); // 지금까지의 접속 시간 누적 반영
+      const outUid = p.account ? p.account.userId : null;
+      if (p.account) {
+        const u = users[p.account.userId];
+        if (u && u.token) { tokens.delete(u.token); u.token = undefined; persistUser(p.account.userId); } // 토큰 무효화
+      }
+      p.account = null; p.isAdmin = false; p.loginAt = 0;
+      if (outUid && connsOf(outUid).length === 0) notifyFriendsPresence(outUid, false); // 마지막 세션 로그아웃 → 종료 알림
+      return;
+
+    } else if (msg.type === "changePassword") {
+      if (!p.account) { send(p, { type: "pwError", reason: "로그인이 필요합니다." }); return; }
+      const u = users[p.account.userId];
+      if (!u) { send(p, { type: "pwError", reason: "계정을 찾을 수 없습니다." }); return; }
+      const uid = p.account.userId;
+      // 새 비번 : 신버전은 pwhNext(해시), 구버전 클라는 next(원문) — 원문일 때만 정책 검사 가능
+      if (msg.next != null && !validPassword(msg.next)) { send(p, { type: "pwError", reason: PW_RULE_MSG }); return; }
+      const nextPwh = credOf(uid, msg.pwhNext, msg.next);
+      if (!nextPwh) { send(p, { type: "pwError", reason: PW_RULE_MSG }); return; }
+      if (!authAllow(p)) { send(p, { type: "pwError", reason: "시도가 너무 잦습니다. 잠시 후 다시 시도하세요." }); return; }
+      verifyPassword(uid, u, { pwh: msg.pwhCurrent, password: msg.current }, (ok) => {
+        if (!authDone(p)) return;
+        if (!ok) { send(p, { type: "pwError", reason: "현재 비밀번호가 틀렸습니다." }); return; }
+        setPassword(u, nextPwh, (done) => {
+          if (!wsOpen(p)) return;
+          if (!done) { send(p, { type: "pwError", reason: "변경에 실패했습니다. 다시 시도하세요." }); return; }
+          persistUser(uid);
+          send(p, { type: "pwOk" });
+        });
+      });
+      return;
+
+    } else if (msg.type === "savePrefs") {
+      // 계정별 차 색 + 설정 영속 저장 (로그인 유저만, 값 검증 후 저장)
+      if (!p.account) return;
+      const u = users[p.account.userId];
+      if (!u) return;
+      const prefColor = sanitizeColor(p, msg.color); // 형식 + 우주 스킨 소유 검증
+      if (prefColor) { u.color = prefColor; p.color = prefColor; }
+      const s = msg.settings;
+      if (s && typeof s === "object") {
+        const clean = (u.settings && typeof u.settings === "object") ? { ...u.settings } : {};
+        if (typeof s.volume === "number" && isFinite(s.volume)) clean.volume = Math.min(1, Math.max(0, s.volume));
+        if (typeof s.fov === "number" && isFinite(s.fov)) clean.fov = Math.min(100, Math.max(40, Math.round(s.fov)));
+        if (typeof s.showOthers === "boolean") clean.showOthers = s.showOthers;
+        if (typeof s.showSpeed === "boolean") clean.showSpeed = s.showSpeed;
+        if (typeof s.showMyName === "boolean") clean.showMyName = s.showMyName;
+        if (typeof s.frNotice === "boolean") clean.frNotice = s.frNotice;
+        if (["tl", "tr", "bl", "br"].includes(s.hudMm)) clean.hudMm = s.hudMm;
+        if (["tl", "tr", "bl", "br"].includes(s.hudChat)) clean.hudChat = s.hudChat;
+        if (["wasd", "arrows", "both"].includes(s.keys)) clean.keys = s.keys; // 조작키
+        u.settings = clean;
+      }
+      persistUser(p.account.userId);
+      return;
+    }
+
+    if (msg.type === "join") {
+      p.name = p.account ? p.account.nickname : sanitizeName(msg.name);
+      p.matchType = null;
+      // 칭호 : 입장자에게 접속자들의 장착 칭호 일람 + 내 칭호를 모두에게 (이름표 아래 표시용)
+      sendTitlesMap(p);
+      if (p.account) broadcastTitleOf(p.account.userId);
+      // 경쟁전/일반전 : 방 선택 없는 자동 매치메이킹 (규칙은 같고 점수/최소인원만 다름)
+      if (msg.mode === "rank" || msg.mode === "casual") { joinMatch(id, p, msg.mode); return; }
+      const mode = (msg.mode === "racing") ? "racing"
+        : (msg.mode === "hard") ? "hard"
+        : (msg.mode === "serp") ? "serp"
+        : (msg.mode === "a1") ? "a1"
+        : (msg.mode === "a2") ? "a2"
+        : (msg.mode === "a3") ? "a3"
+        : (msg.mode === "c1") ? "c1"
+        : (msg.mode === "c2") ? "c2"
+        : (msg.mode === "c3") ? "c3"
+        : (msg.mode === "d1") ? "d1"
+        : (msg.mode === "retro1") ? "retro1"
+        : (msg.mode === "retro2") ? "retro2"
+        : (msg.mode === "test") ? "test"
+        : (msg.mode === "boss") ? "boss"
+        : (msg.mode === "plaza") ? "plaza"
+        : (msg.mode === "sumo") ? "sumo"
+        : (msg.mode === "pro") ? "pro" : "survival";
+
+      if (mode === "pro") {
+        // 프로 진입 = 방 목록 화면(브라우저). 방은 따로 만들거나 골라 들어간다.
+        p.mode = "pro"; p.active = true; p.roomId = null;
+        simInit(p);
+        resetMotion(p);
+        send(p, { type: "roomList", rooms: roomSummaries() });
+        console.log(`[>] player ${id} entered pro lobby browser`);
+        return;
+      }
+
+      p.mode = mode; p.active = true; p.roomId = null;
+      resetMotion(p);
+      p.taModeSince = Date.now(); // 타임어택 기록 하한 검증 기준(모드 입장 시각)
+      if (mode === "boss") {
+        // 보스전 : 라운드 진행 중이면 관전 대기(다음 라운드 자동 합류), 아니면 즉시 참가
+        simInit(p);
+        p.bossSpec = bossWorld.state === "running";
+        p.bossLives = BOSS_LIVES; p.bossDeadUntil = 0; p.bossSurviveMs = 0;
+        if (p.bossSpec) { p.state = null; }
+        else bossRespawnPlayer(id, p, 1500);
+        sendBossSync(p);
+        console.log(`[>] player ${id} joined boss as "${p.name}"${p.bossSpec ? " (spectate)" : ""}`);
+        return;
+      }
+      simInit(p); // v4 : 서버 권위 시뮬 상태 생성 (p.state 는 p.sim 별칭)
+      if (mode === "survival") {
+        const spawn = pickSpawn(id);
+        spawnSim(p, spawn.x, spawn.y, spawn.angle, INVULN_MS);
+        p.graceUntil = Date.now() + GRACE_MS;
+      } else if (mode === "plaza") {
+        // 광장 : 자유 주행(승패·기록·판정 없음). 스폰만 배치.
+        const spawn = pickPlazaSpawn(id);
+        spawnSim(p, spawn.x, spawn.y, spawn.angle, 0);
+        p.invulnUntil = 0; p.graceUntil = Date.now() + GRACE_MS;
+      } else if (mode === "sumo") {
+        // 스모 : 원형 링 위 스폰. 넉백/링아웃 전부 서버 권위.
+        const spawn = pickSumoSpawn(id);
+        spawnSim(p, spawn.x, spawn.y, spawn.angle, INVULN_MS);
+        p.graceUntil = Date.now() + GRACE_MS;
+        p.punchCd = 0; p.punchStart = 0; p.punchHit = false;
+      } else { // 타임어택/테스트 : 서버도 출발선 뒤 배치를 안다 (클라는 같은 좌표를 예측)
+        const env = MODE_ENV[mode];
+        if (env && env.track) {
+          const st = SIM.placeBehindStart(env.track);
+          spawnSim(p, st.x, st.y, st.angle, 0);
+        }
+        p.invulnUntil = 0; p.graceUntil = 0;
+        const field = RECORD_FIELD[mode];
+        if (field) send(p, { type: "topRecords", records: topRecordsList(field) });
+      }
+      console.log(`[>] player ${id} joined ${p.mode} as "${p.name}"`);
+
+    } else if (msg.type === "createRoom") {
+      if (!p.active || p.mode !== "pro" || p.roomId != null) return;
+      const laps = clampInt(msg.laps, 1, 20, 3);
+      const maxPlayers = clampInt(msg.maxPlayers, 2, PRO_MAX, 7); // 최소 2명
+      const timeLimitMs = TIME_LIMITS.includes(msg.timeLimit) ? msg.timeLimit : 0;
+      let course, trackIndex;
+      if (msg.course === "random") { course = "random"; trackIndex = Math.floor(Math.random() * NAMED_COURSES); }
+      else { trackIndex = clampInt(msg.course, 0, NAMED_COURSES - 1, 0); course = trackIndex; }
+      const name = sanitizeRoomName(msg.name) || `${p.name}의 방`;
+      const room = {
+        id: nextRoomId++, name, hostId: id, state: "lobby",
+        laps, course, trackIndex, timeLimitMs, maxPlayers,
+        countdownAt: 0, raceEndAt: 0, raceStartAt: 0,
+      };
+      rooms.set(room.id, room);
+      enterRoom(id, p, room.id);
+      console.log(`[>] player ${id} created room ${room.id} "${name}"`);
+
+    } else if (msg.type === "joinRoom") {
+      if (!p.active || p.mode !== "pro" || p.roomId != null) return;
+      const room = rooms.get(msg.roomId);
+      if (!room || isMatchRoom(room)) { send(p, { type: "joinReject", reason: "방이 사라졌습니다." }); return; } // 매치메이킹 방은 직접 참가 불가
+      if (room.state !== "lobby") { send(p, { type: "joinReject", reason: "레이스가 진행 중인 방입니다." }); return; }
+      if (roomMembers(room.id).length >= room.maxPlayers) { send(p, { type: "joinReject", reason: "방이 가득 찼습니다." }); return; }
+      enterRoom(id, p, room.id);
+
+    } else if (msg.type === "leaveRoom") {
+      if (p.roomId == null) return;
+      leaveRoom(id, p);
+      send(p, { type: "roomList", rooms: roomSummaries() }); // 방 목록으로 복귀
+
+    } else if (msg.type === "leave") {
+      if (p.mode === "pro" && p.roomId != null) leaveRoom(id, p);
+      p.active = false; p.state = null; p.roomId = null; p.matchType = null;
+
+    } else if (msg.type === "ready") {
+      if (p.roomId == null) return;
+      const room = rooms.get(p.roomId);
+      if (!room || room.state !== "lobby" || isMatchRoom(room)) return; // 매치메이킹 방엔 준비 없음
+      p.ready = !!msg.value;
+      broadcastRoom(p.roomId);
+      maybeStartCountdown(p.roomId);
+
+    } else if (msg.type === "chat") {
+      // 전역 채팅 — 메뉴/로비 등 미입장자도 보내고 받을 수 있다.
+      const text = sanitizeChat(msg.text);
+      if (!text) return;
+      // 관리자 명령 : 공개 채팅에 안 올라가고 본인에게만 결과 회신 (/경쟁전… 이 표준, 구 /랭크… 도 동작)
+      if (p.isAdmin && (text.startsWith("/경쟁전") || text.startsWith("/랭크"))) { handleRankCommand(p, text); return; }
+      if (p.isAdmin && text.startsWith("/어디")) { handleWhereCommand(p, text); return; } // 유저 활동 조회
+      if (p.isAdmin && text.startsWith("/온라인")) { handleOnlineCommand(p); return; }   // 온라인 명단
+      if (p.isAdmin && text.startsWith("/이벤트")) { handleEventCommand(p, text); return; } // 이벤트 선물 발송
+      if (p.isAdmin && text.startsWith("/점수초기화")) { handleScoreResetCommand(p, text); return; } // 경쟁전 점수 리셋
+      if (p.isAdmin && text.startsWith("/기록삭제")) { handleRecordDeleteCommand(p, text); return; } // 코스 최고기록 삭제
+      if (p.isAdmin && text.startsWith("/닉변")) { handleRenameCommand(p, text); return; }         // 계정 닉네임 변경
+      if (p.isAdmin && text.startsWith("/추방")) { handleKickCommand(p, text); return; }          // 온라인 강제 퇴장
+      if (p.isAdmin && text.startsWith("/차단해제")) { handleBanCommand(p, text, false); return; } // 계정 차단 해제
+      if (p.isAdmin && text.startsWith("/차단명단")) { handleBanListCommand(p); return; }          // 차단 목록
+      if (p.isAdmin && text.startsWith("/차단")) { handleBanCommand(p, text, true); return; }      // 계정 차단(+접속 중이면 즉시 추방)
+      // 관리자의 알 수 없는 /명령 은 공개 채팅에 새지 않게 삼킨다 (오타/구버전 명령 보호).
+      if (p.isAdmin && text.startsWith("/")) { send(p, { type: "chat", id: 0, name: "시스템", text: `알 수 없는 명령어: ${text.split(/\s+/)[0]}`, t: Date.now() }); return; }
+      // 친구 채팅 : 친구 개별(1:1) 대화만 — to(친구 userId)에게만 전달 (본인 에코 포함).
+      //  전체 히스토리엔 안 남고, 관리 로그(chat-log.jsonl)엔 [친구→닉] 접두어로 기록.
+      if (msg.scope === "friends") {
+        if (!p.account || !users[p.account.userId]) return;
+        const me = p.account.userId;
+        const fr = friendsOf(users[me]);
+        const toId = typeof msg.to === "string" && msg.to ? msg.to : null;
+        if (!toId || !fr.includes(toId) || !users[toId]) return; // 대상 없음/비친구 → 무시
+        const toNick = users[toId].nickname || toId;
+        const fm = { type: "chat", id, name: p.account.nickname, text, t: Date.now(), admin: !!p.isAdmin, friend: true, dm: true, to: toNick, fromUid: me };
+        pushDmHistory(me, fm);
+        pushDmHistory(toId, fm); // 오프라인이어도 쌓아둔다 → 다음 로그인 때 최근 대화로 수신
+        for (const q of connsOf(me)) send(q, fm); // 본인 에코 (모든 내 접속)
+        const conns = connsOf(toId);
+        for (const q of conns) send(q, fm);
+        if (!conns.length) send(p, { type: "chat", id: 0, name: "시스템", text: `${toNick}님이 지금은 오프라인이에요. 접속하면 최근 대화로 전달됩니다.`, t: Date.now(), friend: true });
+        logChat(p, p.account.nickname, `[친구→${toNick}] ` + text, fm.t, fm.admin);
+        return;
+      }
+      const name = p.account ? p.account.nickname : (p.active ? p.name : sanitizeName(msg.name));
+      const chatMsg = { type: "chat", id, name, text, t: Date.now(), admin: !!p.isAdmin };
+      chatHistory.push(chatMsg);
+      if (chatHistory.length > CHAT_HISTORY_MAX) chatHistory.shift(); // 인게임 표시는 최근 50개만
+      logChat(p, name, text, chatMsg.t, chatMsg.admin);              // 로그 파일엔 몽땅 영구 저장
+      broadcastConnected(chatMsg);
+
+    } else if (msg.type === "getRankings") {
+      // 로비 랭킹 : 특정 코스(모드)의 "전체" 순위(닉/기록)를 정렬해 보낸다. 페이지네이션은 클라가 처리.
+      const field = RECORD_FIELD[msg.mode];
+      if (!field) return;
+      const arr = [];
+      for (const uid in users) { const u = users[uid]; if (u[field]) arr.push({ name: u.nickname, ms: u[field] }); }
+      arr.sort(RECORD_DESC[msg.mode] ? (a, b) => b.ms - a.ms : (a, b) => a.ms - b.ms);
+      send(p, { type: "rankings", mode: msg.mode, entries: arr });
+
+    } else if (msg.type === "restart") {
+      // 타임어택 출발선 복귀 — TCP 보장 명령 (tryRestart 가 자격/쿨다운 검증)
+      tryRestart(p);
+
+    } else if (msg.type === "timeAttack") {
+      // v4 : 타임어택 기록은 서버가 자기 시뮬로 직접 산출한다(doTick attackStep) — 클라 제출 무시.
+
+    } else if (msg.type === "titlesInfo") {
+      // 칭호 패널 데이터 요청
+      sendTitlesInfo(p);
+
+    } else if (msg.type === "equipTitle") {
+      // 칭호 장착/해제 : 보유한 것만 (null = 해제)
+      if (!p.account || !users[p.account.userId]) return;
+      const u = users[p.account.userId];
+      const key = typeof msg.key === "string" && msg.key ? msg.key : null;
+      if (key && !(Array.isArray(u.titles) && u.titles.includes(key))) return; // 미보유 → 무시
+      if ((u.title || null) === key) return;
+      u.title = key;
+      persistUser(p.account.userId);
+      for (const q of connsOf(p.account.userId)) sendTitlesInfo(q);
+      broadcastTitleOf(p.account.userId);
+
+    } else if (msg.type === "punch") {
+      // 스모 : 주먹 뻗기 (3초 쿨다운). 유효하면 상태 기록 + 모든 스모 참가자에게 애니 브로드캐스트.
+      if (p.mode !== "sumo" || !p.active || !p.state) return;
+      const now = Date.now();
+      if (now < (p.punchCd || 0)) return;      // 쿨다운 중
+      p.punchCd = now + PUNCH_CD;
+      p.punchStart = now; p.punchHit = false;  // sumoTick 이 히트 판정
+      broadcastMode("sumo", { type: "sumoPunch", id, at: now });
+
+    } else if (msg.type === "sumoDead") {
+      // v4 : 링아웃은 서버가 판정한다(doTick) — 구클라 자가신고는 무시.
+
+    } else if (msg.type === "friendsInfo") {
+      // 친구 패널 데이터 요청
+      sendFriendsInfo(p);
+
+    } else if (msg.type === "friendReq") {
+      // 친구 신청 : pid(접속 id, 차량 클릭) 또는 name(닉네임, 패널 입력)
+      if (!p.account) { send(p, { type: "friendError", reason: "로그인 후 친구 신청을 할 수 있습니다." }); return; }
+      let targetId = null;
+      if (msg.pid != null) {
+        const q = players.get(Number(msg.pid));
+        if (!q) { send(p, { type: "friendError", reason: "상대를 찾을 수 없습니다." }); return; }
+        if (!q.account) { send(p, { type: "friendError", reason: "게스트에게는 친구 신청을 보낼 수 없습니다." }); return; }
+        targetId = q.account.userId;
+      } else if (typeof msg.name === "string" && msg.name.trim()) {
+        const matches = findUserIdsByName(msg.name.trim());
+        if (!matches.length) { send(p, { type: "friendError", reason: "없는 닉네임입니다." }); return; }
+        if (matches.length > 1) { send(p, { type: "friendError", reason: "같은 닉네임 계정이 여러 개입니다." }); return; }
+        targetId = matches[0];
+      }
+      const me = p.account.userId;
+      if (!targetId || !users[targetId]) { send(p, { type: "friendError", reason: "상대를 찾을 수 없습니다." }); return; }
+      if (targetId === me) { send(p, { type: "friendError", reason: "자기 자신에게는 보낼 수 없습니다." }); return; }
+      const mu = users[me], tu = users[targetId];
+      if (friendsOf(mu).includes(targetId)) { send(p, { type: "friendError", reason: "이미 친구입니다." }); return; }
+      if (reqsOf(mu).includes(targetId)) { acceptFriend(p, targetId); return; } // 맞신청 = 즉시 수락
+      if (reqsOf(tu).includes(me)) { send(p, { type: "friendError", reason: "이미 신청을 보냈습니다." }); return; }
+      tu.friendReqs.push(me);
+      persistUser(targetId);
+      send(p, { type: "friendOk", kind: "requested", id: targetId, nickname: tu.nickname || targetId });
+      sendFriendsInfo(p);
+      const oq = onlineOf(targetId);
+      if (oq) { send(oq, { type: "friendEvent", kind: "req", nickname: mu.nickname || me }); sendFriendsInfo(oq); }
+
+    } else if (msg.type === "friendAccept") {
+      acceptFriend(p, String(msg.id || ""));
+
+    } else if (msg.type === "friendDecline") {
+      // 받은 신청 거절
+      if (!p.account) return;
+      const mu = users[p.account.userId];
+      const i = reqsOf(mu).indexOf(String(msg.id || ""));
+      if (i >= 0) { mu.friendReqs.splice(i, 1); persistUser(p.account.userId); }
+      sendFriendsInfo(p);
+
+    } else if (msg.type === "friendCancel") {
+      // 보낸 신청 취소 : 상대의 받은 신청에서 나를 제거
+      if (!p.account) return;
+      const tid = String(msg.id || "");
+      const tu = users[tid];
+      if (tu) {
+        const i = reqsOf(tu).indexOf(p.account.userId);
+        if (i >= 0) {
+          tu.friendReqs.splice(i, 1);
+          persistUser(tid);
+          const oq = onlineOf(tid);
+          if (oq) sendFriendsInfo(oq);
+        }
+      }
+      sendFriendsInfo(p);
+
+    } else if (msg.type === "friendRemove") {
+      // 친구 삭제 (양쪽에서 제거)
+      if (!p.account) return;
+      const me = p.account.userId, tid = String(msg.id || "");
+      const mu = users[me], tu = users[tid];
+      let i = friendsOf(mu).indexOf(tid);
+      if (i >= 0) { mu.friends.splice(i, 1); persistUser(me); }
+      if (tu) {
+        i = friendsOf(tu).indexOf(me);
+        if (i >= 0) { tu.friends.splice(i, 1); persistUser(tid); }
+        const oq = onlineOf(tid);
+        if (oq) sendFriendsInfo(oq);
+        recomputeTitles(tid); // 친구 수 감소 → 마당발/인싸 회수 가능
+      }
+      sendFriendsInfo(p);
+      recomputeTitles(me);
+
+    } else if (msg.type === "playerInfo") {
+      // 차량 클릭 : 접속 id 로 상대 프로필 조회 (대시보드 + 친구 관계)
+      const q = players.get(Number(msg.pid));
+      if (!q) { send(p, { type: "playerInfo", missing: true }); return; }
+      const info = {
+        type: "playerInfo", pid: Number(msg.pid),
+        name: q.account ? q.account.nickname : (q.name || "게스트"),
+        guest: !q.account, admin: !!q.isAdmin, activity: activityOf(q),
+      };
+      if (q.account && users[q.account.userId]) {
+        const tu = users[q.account.userId];
+        info.uid = q.account.userId;
+        info.rankScore = rankScoreOf(tu);
+        info.rankWins = tu.rankWins || 0;
+        info.rankPlays = tu.rankPlays || 0;
+        info.casualWins = tu.casualWins || 0;
+        info.casualPlays = tu.casualPlays || 0;
+        info.bestBoss = tu.bestBoss || 0;
+        info.totalTime = (tu.totalTime || 0) + (q.loginAt ? Date.now() - q.loginAt : 0);
+        if (p.account && users[p.account.userId]) {
+          const me = p.account.userId, mu = users[p.account.userId];
+          info.rel = info.uid === me ? "self"
+            : friendsOf(mu).includes(info.uid) ? "friend"
+            : reqsOf(tu).includes(me) ? "outgoing"
+            : reqsOf(mu).includes(info.uid) ? "incoming" : "none";
+        } else {
+          info.rel = "guestme"; // 내가 게스트 → 친구 기능 사용 불가
+        }
+      }
+      send(p, info);
+
+    } else if (msg.type === "claimGift") {
+      // 이벤트 선물 수령 : 저장된 선물을 계정에 적용하고 제거 (수령 버튼을 눌러야 적용)
+      if (!p.account) return;
+      const u = users[p.account.userId];
+      if (!u || !u.gift) return;
+      if (u.gift.item === "spaceSkin") { u.spaceSkin = true; u.color = SPACE_SKIN_COLOR; p.color = u.color; } // 소유 등록 + 차 색 = 우주 스킨
+      delete u.gift;
+      persistUser(p.account.userId);
+      send(p, { type: "giftClaimed", color: u.color || null, spaceSkin: !!u.spaceSkin });
+
+    }
+  });
+
+  ws.on("close", () => {
+    const pc = players.get(id);
+    if (pc) {
+      flushConnectedTime(pc); // 접속 종료 시점까지의 접속 시간 누적 반영
+      if (pc.mode === "pro" && pc.active && pc.roomId != null) leaveRoom(id, pc);
+    }
+    players.delete(id);
+    // 이 계정의 마지막 접속이 끊겼으면 친구들에게 종료 알림 (다른 탭이 남아 있으면 조용히)
+    if (pc && pc.account && connsOf(pc.account.userId).length === 0) notifyFriendsPresence(pc.account.userId, false);
+    console.log(`[-] player ${id} disconnected (total ${players.size})`);
+  });
+
+  ws.on("error", () => {}); // 비정상 종료 무시
+});
+
+// 주기적으로 ping 을 보내 죽은(유령) 연결을 빨리 정리하고 살아있는 연결은 유지한다.
+//  - 8초마다 ping → 응답(pong) 없으면 다음 주기에 강제 종료(최대 ~16초 내 정리).
+//  - 비정상 종료/네트워크 끊김으로 남은 연결이 인원수에 오래 잡히는 것을 막는다.
+const heartbeat = setInterval(() => {
+  for (const [, p] of players) {
+    if (p.ws.isAlive === false) { p.ws.terminate(); continue; }
+    p.ws.isAlive = false;
+    try { p.ws.ping(); } catch {}
+  }
+}, 8000);
+wss.on("close", () => clearInterval(heartbeat));
+
+// =============================================================================
+//  서버 권위 충돌 판정
+// -----------------------------------------------------------------------------
+//  규칙(아케이드 — 지렁이 키우기의 반대) : "상대의 머리(앞코)가 내 차체에
+//  닿으면 내가 죽는다." 단, 내 머리도 상대 몸에 박혀 있으면(=쌍방 정면) 무승부.
+//  서버가 모든 차량을 같은 프레임 좌표로 보고 단독 결정하므로 두 PC의 판정이
+//  어긋날 수 없다. 빠른 통과(터널링)는 머리의 직전→현재 궤적을 샘플링(스윕)해 막는다.
+// =============================================================================
+
+// 한 점이 차량의 차체 사각형(OBB) 안에 있는지
+function pointInCar(px, py, s) {
+  const dx = px - s.x;
+  const dy = py - s.y;
+  const cos = Math.cos(s.angle);
+  const sin = Math.sin(s.angle);
+  const lx = dx * cos + dy * sin;
+  const ly = -dx * sin + dy * cos;
+  return Math.abs(lx) <= CAR_LEN / 2 && Math.abs(ly) <= CAR_WID / 2;
+}
+
+// 차량의 머리(앞코) 월드 좌표
+function headOf(s) {
+  return {
+    x: s.x + Math.cos(s.angle) * (CAR_LEN / 2),
+    y: s.y + Math.sin(s.angle) * (CAR_LEN / 2),
+  };
+}
+
+// 머리의 직전→현재 궤적을 N등분해 한 점이라도 상대 몸에 들어가면 명중(스윕)
+function sweptHeadHit(prevHead, curHead, target) {
+  const N = 4;
+  for (let k = 0; k <= N; k++) {
+    const t = k / N;
+    const x = prevHead.x + (curHead.x - prevHead.x) * t;
+    const y = prevHead.y + (curHead.y - prevHead.y) * t;
+    if (pointInCar(x, y, target)) return true;
+  }
+  return false;
+}
+
+// 이름 정리 : 좌우 공백 제거, 제어문자 제거, 12자 제한, 비면 기본값
+function sanitizeName(name) {
+  let s = (typeof name === "string" ? name : "").replace(/[\x00-\x1f]/g, "").trim();
+  if (s.length > 12) s = s.slice(0, 12);
+  return s || "Player";
+}
+
+// 채팅 정리 : 제어문자 제거, 좌우 공백 제거, 200자 제한
+function sanitizeChat(text) {
+  let s = (typeof text === "string" ? text : "").replace(/[\x00-\x1f]/g, "").trim();
+  if (s.length > 200) s = s.slice(0, 200);
+  return s;
+}
+
+// 서바이벌 부활 위치 : 다른 서바이벌 플레이어로부터 가장 멀리 떨어진 곳
+function pickSpawn(selfId) {
+  const margin = 250, safe = 700;
+  let best = { x: MAP_SIZE / 2, y: MAP_SIZE / 2 }, bestD = -1;
+  for (let i = 0; i < 30; i++) {
+    const x = margin + Math.random() * (MAP_SIZE - 2 * margin);
+    const y = margin + Math.random() * (MAP_SIZE - 2 * margin);
+    let minD = Infinity;
+    for (const [id, p] of players) {
+      if (id === selfId || !p.active || p.mode !== "survival" || !p.state) continue;
+      const d = Math.hypot(x - p.state.x, y - p.state.y);
+      if (d < minD) minD = d;
+    }
+    if (minD > bestD) { bestD = minD; best = { x, y }; }
+    if (minD > safe) break;
+  }
+  return { x: best.x, y: best.y, angle: Math.random() * Math.PI * 2 };
+}
+
+function send(p, obj) {
+  if (p.ws.readyState === p.ws.OPEN) p.ws.send(JSON.stringify(obj));
+}
+// 같은 모드의 활성 플레이어들에게만 전송
+function broadcastMode(mode, obj) {
+  const payload = JSON.stringify(obj);
+  for (const [, p] of players) {
+    if (p.active && p.mode === mode && p.ws.readyState === p.ws.OPEN) p.ws.send(payload);
+  }
+}
+// 모든 활성 플레이어에게 전송
+function broadcastAll(obj) {
+  const payload = JSON.stringify(obj);
+  for (const [, p] of players) {
+    if (p.active && p.ws.readyState === p.ws.OPEN) p.ws.send(payload);
+  }
+}
+// 모든 "접속자"(메뉴/로비 포함)에게 전송 — 전역 채팅용
+function broadcastConnected(obj) {
+  const payload = JSON.stringify(obj);
+  for (const [, p] of players) {
+    if (p.ws.readyState === p.ws.OPEN) p.ws.send(payload);
+  }
+}
+
+// 모드별 참가 인원을 "모든 접속자"(메뉴 화면 포함)에게 알린다 → 모드 버튼에 표시
+function broadcastCounts() {
+  const counts = { survival: 0, a1: 0, a2: 0, a3: 0, racing: 0, hard: 0, serp: 0, c1: 0, c2: 0, c3: 0, d1: 0, retro1: 0, retro2: 0, pro: 0, test: 0, rank: 0, casual: 0, boss: 0, plaza: 0, sumo: 0 };
+  for (const [, p] of players) {
+    if (!p.active) continue;
+    // 경쟁전/일반전은 내부적으로 pro 모드라 따로 집계한다 (게이트 인원 표시가 갈려야 함)
+    if (p.matchType === "rank") { counts.rank++; continue; }
+    if (p.matchType === "casual") { counts.casual++; continue; }
+    if (counts[p.mode] !== undefined) counts[p.mode]++;
+  }
+  const payload = JSON.stringify({ type: "counts", ...counts, total: players.size }); // total = 로비 포함 전체 접속자
+  for (const [, p] of players) {
+    if (p.ws.readyState === p.ws.OPEN) p.ws.send(payload);
+  }
+}
+setInterval(broadcastCounts, 1000);
+
+// =============================================================================
+//  프로 레이싱 — 다중 방 시스템
+// -----------------------------------------------------------------------------
+//  - 프로 진입 = 방 목록(브라우저). 방을 만들거나 골라 들어간다.
+//  - 방장이 바퀴/코스/시간제한/최대인원을 설정. 방마다 lobby→countdown→racing→종료.
+//  - 2명 이상 모두 ready 면 5초 카운트다운 후 시작. 카운트다운 동안 이동 불가.
+//  - 종료 = (첫 완주자+10초) 와 (시간제한) 중 먼저 오는 시각 → 전원 자유 레이싱으로.
+//  바퀴/진행도는 클라가 보고, 서버는 순위/타이머/방 상태를 관리한다.
+// =============================================================================
+const PRO_MAX = 7;
+// 카운트다운 = 슬라이드 전환(~1.7초) + 신호등 5초.
+//  클라는 남은 시간 5초부터 신호등을 그리므로, 전환이 걷힌 뒤에 첫 불이 켜진다.
+const COUNTDOWN_MS = 6700;
+const END_TIMER_MS = 10000;
+const NAMED_COURSES = 9;        // 선택 가능한 코스 수 (game.js PRO_COURSES = A-1~C-3, 인덱스 0..8)
+const TIME_LIMITS = [0, 60000, 120000, 180000, 300000]; // 무제한/1/2/3/5분(ms)
+
+// --- 랭크전 : 디스코드 신청(rankAllowed) 유저만, 자동 매치메이킹 방 ---
+//  3명 모이면 신호등 카운트다운(그동안 5명까지 난입), 준비 없음. 맵 = A-1~B-3 랜덤.
+const RANK_MIN = 3;
+const RANK_MAX = 5;
+const RANK_COUNTDOWN_MS = COUNTDOWN_MS; // 커스텀과 동일한 신호등 카운트다운 (전환 후 5초 신호등)
+const RANK_TIME_LIMIT_MS = 300000; // 완주자 없어도 5분이면 종료
+const RANK_COURSES = 6;            // A-1~B-3 (인덱스 0..5)
+const RANK_LAPS = 3;
+const RANK_BASE = 100;             // 기본 점수
+// 등수별 점수 : +10 ~ -10 을 등수 간격대로 균등 분배 (제로섬 — 방 전체 합이 0, 최대 변동 10점)
+//  3명: +10/0/-10, 4명: +10/+3/-3/-10, 5명: +10/+5/0/-5/-10. 탈주(카운트다운/중도)는 최하위 취급(-10).
+const RANK_PTS_MAX = 10;
+function rankDelta(n, place) {
+  n = Math.max(RANK_MIN, Math.min(RANK_MAX, n));
+  const p = Math.max(1, Math.min(n, place));
+  return Math.round(RANK_PTS_MAX * (n + 1 - 2 * p) / (n - 1));
+}
+const RANK_ANON_COLOR = "#b8b2a6"; // 시작 전 익명 차/원 색 (웜 그레이)
+
+// --- 일반전 : 로그인만 하면 누구나(승인 불필요) 들어오는 자동 매치메이킹 방 ---
+//  경쟁전의 규칙을 그대로 따른다 — 랜덤 맵 / 3랩 / 5분 제한 / 시작 전 익명 /
+//  신호등 카운트다운 / 방 선택 불가. 다른 점은 딱 두 가지다.
+//   ① 경쟁전 점수(rankScore)를 전혀 건드리지 않는다 — 감점도 가점도 없고,
+//      탈주 페널티도 없다. 대신 일반전 전적(casualPlays/casualWins)만 따로 쌓는다.
+//      → 랭크 사다리가 오염되지 않으면서 "점수 차감이 없다"가 자연히 성립한다.
+//   ② 2명만 모이면 시작한다(경쟁전은 3명).
+const CASUAL_MIN = 2;
+
+// 매치메이킹 방(경쟁전 + 일반전) 공통 판정.
+//  "커스텀 방이 아니다"(= 목록 비노출, 직접 참가 불가, 준비 개념 없음, 시작 전 익명)를
+//  뜻하는 분기는 전부 이 함수를 쓴다 — 두 모드가 갈리는 곳은 점수/최소인원/입장조건뿐이다.
+const isMatchRoom = (room) => !!room && (room.type === "rank" || room.type === "casual");
+const matchMin = (room) => (room.type === "casual" ? CASUAL_MIN : RANK_MIN);
+const MATCH_LABEL = { rank: "경쟁전", casual: "일반전" };
+
+// 레이스 시작 전(대기/카운트다운)엔 서로 누군지 모르게 이름/색/관리자 표시를 가린다.
+//  → 잘하는 사람 보고 나가는 닷지 방지. 시작(racing)되면 공개되고, 그 뒤로 나가면 실점.
+const rankAnon = (room) => isMatchRoom(room) && room.state !== "racing";
+function rankScoreOf(u) { return typeof u.rankScore === "number" ? u.rankScore : RANK_BASE; }
+function rankAllowedOf(u, userId) { return u.rankAllowed === true || userId === ADMIN_ID; } // 관리자는 항상 허용
+
+let nextRoomId = 1;
+const rooms = new Map(); // roomId -> room
+
+function clampInt(v, lo, hi, def) {
+  v = Math.floor(Number(v));
+  if (!Number.isFinite(v)) return def;
+  return Math.max(lo, Math.min(hi, v));
+}
+function sanitizeRoomName(name) {
+  let s = (typeof name === "string" ? name : "").replace(/[\x00-\x1f]/g, "").trim();
+  if (s.length > 16) s = s.slice(0, 16);
+  return s;
+}
+
+function roomMembers(roomId) {
+  const a = [];
+  for (const [id, p] of players) if (p.active && p.mode === "pro" && p.roomId === roomId) a.push({ id, p });
+  return a;
+}
+function assignSlot(roomId) {
+  const used = new Set();
+  for (const { p } of roomMembers(roomId)) used.add(p.slot);
+  for (let s = 0; s < PRO_MAX; s++) if (!used.has(s)) return s;
+  return 0;
+}
+function hostName(room) {
+  const h = players.get(room.hostId);
+  return h ? h.name : "?";
+}
+
+// 방 목록 요약 (브라우저용)
+function roomSummaries() {
+  const out = [];
+  for (const [, r] of rooms) {
+    if (isMatchRoom(r)) continue; // 매치메이킹 방(경쟁전/일반전)은 커스텀 브라우저에 노출 안 함
+    out.push({
+      id: r.id, name: r.name, host: hostName(r),
+      players: roomMembers(r.id).length, maxPlayers: r.maxPlayers,
+      laps: r.laps, course: r.course, timeLimit: r.timeLimitMs, state: r.state,
+    });
+  }
+  return out;
+}
+function broadcastRoomList() {
+  const payload = JSON.stringify({ type: "roomList", rooms: roomSummaries() });
+  for (const [, p] of players) {
+    if (p.active && p.mode === "pro" && p.roomId == null && p.ws.readyState === p.ws.OPEN) p.ws.send(payload);
+  }
+}
+
+// 방 순위 : 완주자 먼저(빨리 완주한 순) → 미완주는 진행도 높은 순
+function rankedRoom(roomId) {
+  const list = roomMembers(roomId);
+  list.sort((a, b) => {
+    const A = a.p, B = b.p;
+    if (A.finished !== B.finished) return A.finished ? -1 : 1;
+    if (A.finished && B.finished) return A.finishTime - B.finishTime;
+    return (B.prog || 0) - (A.prog || 0);
+  });
+  return list.map((e, i) => ({
+    id: e.id, name: e.p.name, ready: !!e.p.ready, color: e.p.color, // 차 색(미설정 시 undefined → 클라 id색 폴백)
+    lap: e.p.lap || 0, lapMs: e.p.lapMs || 0, finished: !!e.p.finished, rank: i + 1, admin: !!e.p.isAdmin,
+  }));
+}
+
+function broadcastRoom(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  const now = Date.now();
+  // 매치메이킹 대기 중엔 맵 비공개 (맵 보고 나가는 닷지 방지) — 카운트다운부터 공개(스테이지 진입에 필요)
+  const hideMap = isMatchRoom(room) && room.state === "lobby";
+  const msg = {
+    type: "race",
+    roomId, roomName: room.name, hostId: room.hostId,
+    state: room.state, laps: room.laps, course: hideMap ? null : room.course,
+    timeLimit: room.timeLimitMs, maxPlayers: room.maxPlayers, trackIndex: hideMap ? null : room.trackIndex,
+    rank: isMatchRoom(room),           // 매치메이킹 방 여부 (클라 UI 분기 — 준비/공유 버튼 숨김 등)
+    casual: room.type === "casual",    // 그중 일반전인지 (점수 없는 결과 화면/라벨)
+    canReady: roomMembers(roomId).length >= 2, // 최소 2명부터 준비/시작 가능
+    countdownMs: room.state === "countdown" ? Math.max(0, room.countdownAt - now) : 0,
+    endMs: (room.state === "racing" && room.raceEndAt > 0) ? Math.max(0, room.raceEndAt - now) : 0,
+    // v4 : 틱 기준 시각 — 클라 카운트다운 신호등/입력 해제가 서버 시뮬과 같은 시계를 공유
+    tick: serverTick,
+    startTick: room.startTick || 0,
+    players: rankAnon(room) // 랭크전 시작 전 : 이름/색/관리자 가림 (닷지 방지)
+      ? rankedRoom(roomId).map((e) => ({ ...e, name: "???", color: RANK_ANON_COLOR, admin: false }))
+      : rankedRoom(roomId),
+  };
+  for (const { p } of roomMembers(roomId)) send(p, msg);
+}
+
+// 방 입장 (생성/참가 공통)
+function enterRoom(pid, p, roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  p.roomId = roomId;
+  p.ready = false; p.lap = 0; p.lapMs = 0; p.prog = 0; p.finished = false; p.finishTime = 0;
+  p.slot = assignSlot(roomId);
+  p.state = null; p.invulnUntil = 0; p.graceUntil = 0;
+  send(p, { type: "roomJoined", roomId, isHost: room.hostId === pid });
+  // 매치메이킹 대기 중엔 트랙도 비공개 — 카운트다운 브로드캐스트가 실제 trackIndex 를 전달한다
+  const hideMap = isMatchRoom(room) && room.state === "lobby";
+  send(p, { type: "proStart", slot: p.slot, laps: room.laps, trackIndex: hideMap ? null : room.trackIndex });
+  broadcastRoom(roomId);
+  broadcastRoomList();
+}
+
+// 방 퇴장 (방 → 브라우저). 비면 방 삭제, 방장이 나가면 위임.
+function leaveRoom(pid, p) {
+  const rid = p.roomId;
+  if (rid == null) return;
+  p.roomId = null; p.ready = false; p.state = null; p.matchType = null;
+  const room = rooms.get(rid);
+  if (!room) return;
+  const remain = roomMembers(rid);
+  if (remain.length === 0) {
+    // 레이스 중 전원 탈주 = 전원 최하위 처리 (경쟁전은 탈주로 감점 회피 방지, 일반전은 전적만)
+    if (room.state === "racing") {
+      if (room.type === "rank") applyRankScores(room, null);
+      else if (room.type === "casual") applyCasualStats(room, null);
+    }
+    rooms.delete(rid); broadcastRoomList(); return;
+  }
+  if (room.hostId === pid) room.hostId = remain[0].id; // 호스트 위임
+  if (room.state === "countdown" && remain.length < 1) { room.state = "lobby"; room.countdownAt = 0; }
+  // 경쟁전만 : 카운트다운 중 이탈 = 즉시 탈주 패배 감점 (스테이지에서 맵/상대 보고 나가는 닷지 방지).
+  //  일반전은 점수 자체가 없으므로 탈주 페널티도 없다 — 부담 없이 들락거리는 게 캐주얼의 목적.
+  if (room.type === "rank" && room.state === "countdown" && p.account && users[p.account.userId]) {
+    const u = users[p.account.userId];
+    const n = Math.max(RANK_MIN, Math.min(RANK_MAX, remain.length + 1)); // 이탈 직전 인원 기준
+    const delta = rankDelta(n, n); // 탈주 = 최하위(-10)
+    u.rankScore = Math.max(0, rankScoreOf(u) + delta);
+    u.rankPlays = (u.rankPlays || 0) + 1;
+    persistUser(p.account.userId);
+    send(p, { type: "rankResult", win: false, delta, score: u.rankScore, n, dodge: true });
+    sendStats(p);
+    recomputeTitles(p.account.userId); // 점수 변동 → 칭호 재판정
+  }
+  // 카운트다운 중 최소 인원(경쟁전 3 / 일반전 2) 미만이 되면 취소 → 다시 대기
+  if (isMatchRoom(room) && room.state === "countdown" && remain.length < matchMin(room)) {
+    room.state = "lobby"; room.countdownAt = 0;
+  }
+  broadcastRoom(rid);
+  broadcastRoomList();
+  maybeStartCountdown(rid);
+}
+
+function maybeStartCountdown(roomId) {
+  const room = rooms.get(roomId);
+  if (!room || room.state !== "lobby") return;
+  const m = roomMembers(roomId);
+  if (isMatchRoom(room)) {
+    if (m.length < matchMin(room)) return;     // 최소 인원(경쟁전 3 / 일반전 2) 모이면 자동 시작 (준비 없음)
+    room.state = "countdown";
+    room.countdownAt = Date.now() + RANK_COUNTDOWN_MS;
+    room.startTick = serverTick + Math.round(RANK_COUNTDOWN_MS / SIM.TICK_MS); // v4 : 입력 해제 계획 틱
+  { // v4 : 랭크전도 카운트다운 진입 시 그리드 배치
+    const track = TRACKS.pro[room.trackIndex % TRACKS.pro.length];
+    for (const { p } of roomMembers(room.id)) {
+      const g = SIM.proGridPosition(track, p.slot || 0);
+      spawnSim(p, g.x, g.y, g.angle, 0);
+    }
+  }
+    room.raceEndAt = 0;
+    broadcastRoom(roomId);
+    return;
+  }
+  if (m.length < 2 || !m.every((e) => e.p.ready)) return; // 최소 2명 + 전원 준비
+  room.state = "countdown";
+  room.countdownAt = Date.now() + COUNTDOWN_MS;
+  room.startTick = serverTick + Math.round(COUNTDOWN_MS / SIM.TICK_MS); // v4 : 입력 해제 계획 틱
+  { // v4 : 카운트다운 동안 그리드 정지 대기 — 서버가 즉시 배치
+    const track = TRACKS.pro[room.trackIndex % TRACKS.pro.length];
+    for (const { p } of roomMembers(room.id)) {
+      const g = SIM.proGridPosition(track, p.slot || 0);
+      spawnSim(p, g.x, g.y, g.angle, 0);
+    }
+  }
+  room.raceEndAt = 0;
+  broadcastRoom(roomId);
+  broadcastRoomList();
+}
+
+function endRoomRace(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  if (isMatchRoom(room)) return endMatchRace(roomId, room);
+  const members = roomMembers(roomId);
+  const ranked = rankedRoom(roomId);
+  const counted = members.length >= 2;           // 우승 기록은 2명 이상일 때만
+  const winnerId = counted && ranked.length ? ranked[0].id : null;
+
+  for (const { id, p } of members) {
+    // 로그인한 플레이어 통계 갱신(프로 플레이 +1, 우승 시 +1)
+    if (p.account && users[p.account.userId]) {
+      const u = users[p.account.userId];
+      u.proPlays = (u.proPlays || 0) + 1;
+      if (counted && id === winnerId) u.proWins = (u.proWins || 0) + 1;
+      persistUser(p.account.userId);
+      sendStats(p); // 대시보드 통계 갱신(우승/플레이/접속시간/최고기록)
+    }
+    // 다음 라운드 대비 초기화 (준비 해제, 랩/기록 리셋). 방·설정은 그대로 유지.
+    p.ready = false; p.lap = 0; p.lapMs = 0; p.prog = 0; p.finished = false; p.finishTime = 0;
+  }
+  // 방을 처음 대기실 상태로 되돌린다 → 같은 설정으로 다시 준비하거나 나갈 수 있다
+  room.state = "lobby";
+  room.countdownAt = 0; room.raceEndAt = 0; room.raceStartAt = 0; room.startTick = 0;
+  broadcastRoom(roomId);
+  broadcastRoomList();
+}
+
+// =============================================================================
+//  경쟁전 / 일반전 — 자동 매치메이킹
+// -----------------------------------------------------------------------------
+//  두 모드는 같은 코드를 탄다. 규칙(랜덤 맵·3랩·5분·시작 전 익명·준비 없음·재대기 없음)이
+//  동일하고, 갈리는 지점은 셋뿐이다.
+//    입장조건 : 경쟁전 = 디스코드 신청 승인(rankAllowed) / 일반전 = 로그인만
+//    최소인원 : 경쟁전 3명 / 일반전 2명
+//    종료처리 : 경쟁전 = 점수 반영 / 일반전 = 전적만 (점수 무변동)
+//  - 입장 = 자리 있는 같은 타입 방(대기/카운트다운·5명 미만)에 자동 배정, 없으면 새 방.
+//  - 최소 인원이 모이면 신호등 카운트다운(그동안 난입 가능), 미만이 되면 취소.
+// =============================================================================
+function joinMatch(pid, p, type) {
+  const label = MATCH_LABEL[type] || "경쟁전";
+  if (!p.account) { send(p, { type: "rankReject", reason: "로그인이 필요합니다." }); return; }
+  const u = users[p.account.userId];
+  // 승인 심사는 경쟁전만 — 일반전은 로그인한 누구나 (경쟁전 승인 대기자의 진입로 역할)
+  if (type === "rank" && (!u || !rankAllowedOf(u, p.account.userId))) {
+    send(p, { type: "rankReject", reason: "디스코드에서 경쟁전 참가 신청 후 이용할 수 있습니다." });
+    return;
+  }
+  if (!u) { send(p, { type: "rankReject", reason: "로그인이 필요합니다." }); return; }
+  p.mode = "pro"; p.active = true; p.roomId = null; p.matchType = type;
+  resetMotion(p);
+  // 자리 있는 같은 타입 방 중 인원이 가장 많은 방부터 채운다 (방 선택 불가 → 무작위 매칭)
+  let best = null, bestN = -1;
+  for (const [, r] of rooms) {
+    if (r.type !== type || (r.state !== "lobby" && r.state !== "countdown")) continue;
+    const n = roomMembers(r.id).length;
+    if (n >= RANK_MAX) continue;
+    if (n > bestN) { best = r; bestN = n; }
+  }
+  if (!best) {
+    const trackIndex = Math.floor(Math.random() * RANK_COURSES); // 맵 = A-1~B-3 랜덤
+    best = {
+      id: nextRoomId++, name: label, hostId: 0, state: "lobby", type,
+      laps: RANK_LAPS, course: trackIndex, trackIndex, timeLimitMs: RANK_TIME_LIMIT_MS, maxPlayers: RANK_MAX,
+      countdownAt: 0, raceEndAt: 0, raceStartAt: 0, starters: [], startN: 0,
+    };
+    rooms.set(best.id, best);
+  }
+  enterRoom(pid, p, best.id);
+  maybeStartCountdown(best.id); // 최소 인원째 입장이면 신호등 카운트다운 시작
+  console.log(`[>] player ${pid} matched into ${type} room ${best.id} (${roomMembers(best.id).length}/${RANK_MAX})`);
+}
+
+/* 일반전 마무리 : 점수는 건드리지 않고 전적(판수/1위)만 쌓는다.
+ *  applyRankScores 와 같은 시그니처·같은 room.scored 가드를 쓰되 rankScore/rankPlays/
+ *  rankWins 와 칭호에는 일절 손대지 않는다 — 경쟁전 사다리와 완전히 분리하기 위함.
+ *  탈주자(placeMap 에 없음)도 최하위로 "판수"만 올라간다. 감점이 없으니 페널티는 아니고,
+ *  전적이 실제 참가 횟수와 맞도록 하는 용도다.
+ *  반환 = id → {place} (결과 통지용 — delta/score 는 없다). */
+function applyCasualStats(room, placeMap) {
+  const out = new Map();
+  if (room.scored) return out;
+  room.scored = true;
+  const n = Math.max(CASUAL_MIN, room.startN || CASUAL_MIN);
+  for (const s of room.starters || []) {
+    const u = users[s.uid];
+    if (!u) continue;
+    const place = placeMap && placeMap.has(s.id) ? placeMap.get(s.id) : n; // 탈주자 = 최하위
+    u.casualPlays = (u.casualPlays || 0) + 1;
+    if (place === 1) u.casualWins = (u.casualWins || 0) + 1;
+    persistUser(s.uid);
+    out.set(s.id, { place });
+    // 중도 탈주자도 접속 중이면 대시보드 전적 즉시 갱신
+    for (const [, p2] of players) if (p2.account && p2.account.userId === s.uid) { sendStats(p2); break; }
+  }
+  return out;
+}
+
+// 점수 반영 : 시작 멤버 전원에게 등수별 점수(rankDelta). 중도 탈주자는 최하위 처리(감점 회피 방지).
+//  placeMap = id → 등수 (null 이면 전원 탈주 = 전원 최하위). room.scored 로 이중 반영 방지.
+//  반환 = id → {delta, score, place} (결과 통지용).
+function applyRankScores(room, placeMap) {
+  const out = new Map();
+  if (room.scored) return out;
+  room.scored = true;
+  const n = Math.max(RANK_MIN, Math.min(RANK_MAX, room.startN || RANK_MIN));
+  for (const s of room.starters || []) {
+    const u = users[s.uid];
+    if (!u) continue;
+    const place = placeMap && placeMap.has(s.id) ? placeMap.get(s.id) : n; // 탈주자 = 최하위
+    const delta = rankDelta(n, place);
+    u.rankScore = Math.max(0, rankScoreOf(u) + delta); // 0점 아래로는 안 내려감
+    u.rankPlays = (u.rankPlays || 0) + 1;
+    if (place === 1) u.rankWins = (u.rankWins || 0) + 1;
+    persistUser(s.uid);
+    out.set(s.id, { delta, score: u.rankScore, place });
+    // 중도 탈주자도 접속 중이면 대시보드 점수 즉시 갱신
+    for (const [, p2] of players) if (p2.account && p2.account.userId === s.uid) { sendStats(p2); break; }
+    recomputeTitles(s.uid); // 도전자/에이스/챔피언 즉시 재판정 (점수 하락 시 회수 포함)
+  }
+  return out;
+}
+
+// 닉네임(대소문자 무시)으로 계정 아이디 찾기 — 없으면 아이디 직접 입력으로 폴백.
+//  닉 중복 방지 이전의 옛 중복 닉이 있으면 여러 개가 나올 수 있어 배열로 반환한다.
+function findUserIdsByName(name) {
+  const q = String(name || "").toLowerCase();
+  const byNick = Object.keys(users).filter((id) => (users[id].nickname || "").toLowerCase() === q);
+  if (byNick.length) return byNick;
+  return users[name] ? [name] : [];
+}
+
+// 관리자 랭크 명령 : 채팅창에서 신청 승인/해제를 즉시 처리 (서버 재시작 불필요, 여러 명 한 번에)
+//  /경쟁전허용 닉네임1 닉네임2 …  /경쟁전해제 닉네임 …  /경쟁전명단  (닉네임 기준, 아이디도 폴백 허용)
+function handleRankCommand(p, text) {
+  const reply = (t) => send(p, { type: "chat", id: 0, name: "시스템", text: t, t: Date.now() });
+  const parts = parseArgs(text);
+  const cmd = parts[0].replace("/랭크", "/경쟁전"), names = parts.slice(1); // 구 /랭크… 별칭 → /경쟁전… 으로 정규화
+  if (cmd === "/경쟁전명단") {
+    const allowed = Object.keys(users).filter((id) => users[id].rankAllowed === true).map((id) => users[id].nickname || id);
+    reply(allowed.length ? `경쟁전 허용 ${allowed.length}명: ${allowed.join(", ")}` : "경쟁전 허용된 계정이 없습니다.");
+    return;
+  }
+  const on = cmd === "/경쟁전허용";
+  if (!on && cmd !== "/경쟁전해제") { reply("명령어: /경쟁전허용 닉네임…  /경쟁전해제 닉네임…  /경쟁전명단"); return; }
+  if (!names.length) { reply(`사용법: ${cmd} 닉네임1 닉네임2 …`); return; }
+  const done = [], missing = [], dup = [];
+  for (const name of names) {
+    const matches = findUserIdsByName(name);
+    if (!matches.length) { missing.push(name); continue; }
+    if (matches.length > 1) { dup.push(`${name}(${matches.join(",")})`); continue; } // 옛 중복 닉 → 아이디로 지정 요청
+    const id = matches[0], u = users[id];
+    u.rankAllowed = on;
+    persistUser(id);
+    done.push(u.nickname || id);
+    // 접속 중이면 클라 상태(경쟁전 카드/대시보드)도 즉시 갱신
+    for (const [, p2] of players) if (p2.account && p2.account.userId === id) { sendStats(p2); break; }
+  }
+  let out = done.length ? `${on ? "허용" : "해제"} 완료 ${done.length}명: ${done.join(", ")}` : "";
+  if (missing.length) out += `${out ? " / " : ""}없는 닉네임: ${missing.join(", ")}`;
+  if (dup.length) out += `${out ? " / " : ""}닉 중복(아이디로 지정하세요): ${dup.join(", ")}`;
+  reply(out);
+}
+
+// 유저의 현재 활동 라벨 (관리자 /어디 조회용)
+const MODE_LABEL = {
+  survival: "서바이벌", test: "주행 테스트",
+  a1: "연습 A-1", a2: "연습 A-2", a3: "연습 A-3",
+  racing: "연습 B-1", hard: "연습 B-2", serp: "연습 B-3",
+  c1: "연습 C-1", c2: "연습 C-2", c3: "연습 C-3", d1: "연습 D-1",
+  retro1: "레트로 초보자 코스", retro2: "레트로 어려움 코스",
+  boss: "보스전", plaza: "광장", sumo: "스모",
+};
+function activityOf(p) {
+  if (!p.active) return "로비";
+  if (p.mode === "pro") {
+    const kind = MATCH_LABEL[p.matchType] || "커스텀";
+    if (p.roomId == null) return "커스텀 방 목록";
+    const room = rooms.get(p.roomId);
+    if (!room) return kind;
+    if (room.state === "racing") return `${kind} 레이스 중`;
+    if (room.state === "countdown") return `${kind} 시작 대기`;
+    return `${kind} 대기실`;
+  }
+  return MODE_LABEL[p.mode] || p.mode;
+}
+
+// 게스트 표시 이름 : 기본 이름("게스트")이거나 이름이 없으면 "게스트" 한 번만 (— "게스트 게스트" 방지)
+function guestLabel(name) { return name && name !== "게스트" ? `게스트 ${name}` : "게스트"; }
+
+/* =============================================================================
+ *  친구 시스템 — 계정 간 친구/신청 (u.friends = 친구 id 목록, u.friendReqs = 받은 신청)
+ *  보낸 신청은 따로 저장하지 않고 "상대의 받은 신청에 내가 있는가"로 파생한다.
+ * ========================================================================== */
+function friendsOf(u) { if (!Array.isArray(u.friends)) u.friends = []; return u.friends; }
+function reqsOf(u) { if (!Array.isArray(u.friendReqs)) u.friendReqs = []; return u.friendReqs; }
+function onlineOf(userId) {
+  for (const [, q] of players) if (q.account && q.account.userId === userId) return q;
+  return null;
+}
+// 같은 계정의 모든 접속 (자동 로그인 토큰 때문에 옛 탭이 남아 다중 접속이 흔하다.
+//  귓속말을 첫 연결에만 보내면 "보고 있는 탭"엔 안 오는 버그가 되므로 전부에 보낸다)
+function connsOf(userId) {
+  const out = [];
+  for (const [, q] of players) if (q.account && q.account.userId === userId) out.push(q);
+  return out;
+}
+
+// 친구 접속/종료 알림 : 같은 계정의 첫 접속(0→1)·마지막 종료(1→0)에만 온라인 친구들에게 보낸다.
+//  (탭 두 개 중 하나만 닫는 건 종료가 아님 — connsOf 로 남은 접속 수를 세서 판단)
+function notifyFriendsPresence(userId, online) {
+  const u = users[userId];
+  if (!u) return;
+  for (const fid of friendsOf(u)) {
+    for (const q of connsOf(fid)) {
+      send(q, { type: "friendEvent", kind: online ? "online" : "offline", nickname: u.nickname || userId });
+      sendFriendsInfo(q); // 친구 패널/귓속말 대상 메뉴의 온라인 점 즉시 갱신
+    }
+  }
+}
+
+// --- 친구 귓속말 최근 대화 (계정별 50개) : 로그인 시 재전송 → 오프라인 수신도 다음 접속 때 보인다
+const DM_HISTORY_MAX = 50;
+const dmHistory = {}; // userId -> [{name,text,t,admin,to,fromUid,...}]
+function pushDmHistory(uid, fm) {
+  const arr = dmHistory[uid] || (dmHistory[uid] = []);
+  arr.push(fm);
+  if (arr.length > DM_HISTORY_MAX) arr.shift();
+}
+// 서버 재시작으로 메모리가 비어도 최근 대화가 보이게 chat-log.jsonl 꼬리에서 복원.
+//  전체 채팅은 chatHistory(50개)로, 귓속말은 계정별 dmHistory 로 나눠 담는다.
+//  귓속말 수신자는 로그의 "[친구→닉]" 닉네임으로 역추적한다 (닉변 이전 기록은 유실될 수 있음 — 허용).
+function prewarmChatHistory() {
+  try {
+    if (!fs.existsSync(CHAT_LOG_FILE)) return;
+    const nick2uid = {};
+    for (const uid in users) nick2uid[String(users[uid].nickname || "").toLowerCase()] = uid;
+    const lines = fs.readFileSync(CHAT_LOG_FILE, "utf8").split("\n").slice(-4000);
+    for (const line of lines) {
+      if (!line) continue;
+      let e; try { e = JSON.parse(line); } catch { continue; }
+      if (typeof e.text !== "string") continue;
+      const m = e.text.match(/^\[친구(→([^\]]+))?\] /); // "[친구→닉] "=귓속말, "[친구] "=구 단체 친구 채팅
+      if (!m) {
+        // 전체 채팅 → 접속 시 보내는 최근 50개로 복원
+        chatHistory.push({ type: "chat", id: 0, name: e.name, text: e.text, t: e.t, admin: !!e.admin });
+        if (chatHistory.length > CHAT_HISTORY_MAX) chatHistory.shift();
+        continue;
+      }
+      if (!m[2] || !e.uid || !users[e.uid]) continue; // 구 단체 기록은 복원하지 않는다 (전체에 새면 안 됨)
+      const fm = { type: "chat", id: 0, name: e.name, text: e.text.slice(m[0].length), t: e.t, admin: !!e.admin, friend: true, dm: true, to: m[2], fromUid: e.uid };
+      pushDmHistory(e.uid, fm);
+      const toId = nick2uid[m[2].toLowerCase()];
+      if (toId && toId !== e.uid) pushDmHistory(toId, fm);
+    }
+  } catch (e) { console.error("[chat-history]", e.message); }
+}
+// 친구 패널 데이터 : 친구(온라인/활동) + 받은 신청 + 보낸 신청
+function sendFriendsInfo(p) {
+  if (!p.account || !users[p.account.userId]) return;
+  const me = p.account.userId;
+  const u = users[me];
+  const friends = friendsOf(u).filter((id) => users[id]).map((id) => {
+    const q = onlineOf(id);
+    return { id, nickname: users[id].nickname || id, online: !!q, activity: q ? activityOf(q) : null };
+  });
+  const incoming = reqsOf(u).filter((id) => users[id]).map((id) => ({ id, nickname: users[id].nickname || id }));
+  const outgoing = [];
+  for (const id in users) {
+    if (id !== me && reqsOf(users[id]).includes(me)) outgoing.push({ id, nickname: users[id].nickname || id });
+  }
+  send(p, { type: "friendsInfo", friends, incoming, outgoing });
+}
+// 수락 : 받은 신청 제거 + 양쪽 친구 등록 + 양쪽 갱신 통지
+function acceptFriend(p, targetId) {
+  if (!p.account) return;
+  const me = p.account.userId;
+  const mu = users[me], tu = users[targetId];
+  if (!mu || !tu) return;
+  const i = reqsOf(mu).indexOf(targetId);
+  if (i < 0) { send(p, { type: "friendError", reason: "받은 신청이 없습니다." }); return; }
+  mu.friendReqs.splice(i, 1);
+  if (!friendsOf(mu).includes(targetId)) mu.friends.push(targetId);
+  if (!friendsOf(tu).includes(me)) tu.friends.push(me);
+  persistUser(me);
+  persistUser(targetId);
+  send(p, { type: "friendOk", kind: "accepted", id: targetId, nickname: tu.nickname || targetId });
+  sendFriendsInfo(p);
+  const q = onlineOf(targetId);
+  if (q) { send(q, { type: "friendEvent", kind: "accept", nickname: mu.nickname || me }); sendFriendsInfo(q); }
+  recomputeTitles(me); recomputeTitles(targetId); // 마당발/인싸 재판정
+}
+
+/* =============================================================================
+ *  칭호 — 조건 만족 시 자동 수여, 미달이 되면 자동 회수(회수는 알림 없음). 전부 서버 판정.
+ *  u.titles = 보유 key 목록 / u.title = 장착 key / u.streakDays, u.lastDay = 연속 접속.
+ *  오프라인 중 수여되면 u.titleNews 에 쌓았다가 다음 로그인 때 알림.
+ * ========================================================================== */
+const TITLE_COURSES = ["bestA1", "bestA2", "bestA3", "bestB1", "bestB2", "bestB3", "bestC1", "bestC2", "bestC3", "bestD1", "bestTime", "bestTimeHard"];
+const TITLE_DEFS = [
+  { key: "newbie",  name: "새내기",          cond: "회원가입",               rar: "common" },
+  { key: "record",  name: "기록 보유자",      cond: "아무 코스 기록 1개 등록", rar: "common" },
+  { key: "top10",   name: "스피드스타",       cond: "아무 코스 TOP10 진입",   rar: "rare" },
+  { key: "first",   name: "코스 정복자",      cond: "아무 코스 전체 1위",     rar: "epic" },
+  { key: "triple",  name: "전설의 드라이버",   cond: "코스 3개 동시 1위",      rar: "legend" },
+  { key: "rank1",   name: "도전자",          cond: "경쟁전 첫 완주",         rar: "common" },
+  { key: "rank150", name: "에이스",          cond: "경쟁전 점수 150 도달",   rar: "rare" },
+  { key: "rank200", name: "챔피언",          cond: "경쟁전 점수 200 도달",   rar: "legend" },
+  { key: "t10h",    name: "단골",            cond: "누적 접속 10시간",       rar: "common" },
+  { key: "t100h",   name: "고인물",          cond: "누적 접속 100시간",      rar: "rare" },
+  { key: "t200h",   name: "터줏대감",        cond: "누적 접속 200시간",      rar: "epic" },
+  { key: "streak7", name: "개근상",          cond: "7일 연속 접속",          rar: "rare" },
+  { key: "fr5",     name: "마당발",          cond: "친구 5명",              rar: "common" },
+  { key: "fr25",    name: "인싸",            cond: "친구 25명",             rar: "rare" },
+];
+const TITLE_BY_KEY = Object.fromEntries(TITLE_DEFS.map((d) => [d.key, d]));
+
+// 연속 접속 : 하루 한 번, 어제에 이어졌으면 +1 아니면 1부터 (로그인 + 60초 주기에서 호출)
+function localDay(t) { const d = new Date(t); return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`; }
+function bumpStreak(u) {
+  const today = localDay(Date.now());
+  if (u.lastDay === today) return;
+  u.streakDays = u.lastDay === localDay(Date.now() - 86400000) ? (u.streakDays || 0) + 1 : 1;
+  u.lastDay = today;
+}
+
+// 코스별 내 순위(1-base, 기록 없으면 0) — 동타이면 공동 순위
+function courseRanksOf(userId) {
+  const out = [];
+  for (const f of TITLE_COURSES) {
+    const my = users[userId][f];
+    if (!my) { out.push(0); continue; }
+    let rank = 1;
+    for (const uid in users) { const v = users[uid][f]; if (v && v < my) rank++; }
+    out.push(rank);
+  }
+  return out;
+}
+
+// 현재 상태 기준 보유해야 할 칭호 집합 (순수 계산 — 저장/알림 없음)
+function computeTitles(userId) {
+  const u = users[userId];
+  const got = new Set(["newbie"]);
+  const ranks = courseRanksOf(userId);
+  if (ranks.some((r) => r >= 1)) got.add("record");
+  if (ranks.some((r) => r >= 1 && r <= 10)) got.add("top10");
+  const firsts = ranks.filter((r) => r === 1).length;
+  if (firsts >= 1) got.add("first");
+  if (firsts >= 3) got.add("triple");
+  if ((u.rankPlays || 0) >= 1) got.add("rank1");
+  const rs = rankScoreOf(u);
+  if (rs >= 150) got.add("rank150");
+  if (rs >= 200) got.add("rank200");
+  const h = (u.totalTime || 0) / 3600000;
+  if (h >= 10) got.add("t10h");
+  if (h >= 100) got.add("t100h");
+  if (h >= 200) got.add("t200h");
+  if ((u.streakDays || 0) >= 7) got.add("streak7");
+  const fc = Array.isArray(u.friends) ? u.friends.length : 0;
+  if (fc >= 5) got.add("fr5");
+  if (fc >= 25) got.add("fr25");
+  return got;
+}
+
+// 재판정 : 새로 얻은 건 알림(오프라인이면 다음 로그인에), 잃은 건 조용히 회수 + 장착 해제
+function recomputeTitles(userId) {
+  const u = users[userId];
+  if (!u) return;
+  const got = computeTitles(userId);
+  const prev = new Set(Array.isArray(u.titles) ? u.titles : []);
+  const added = [...got].filter((k) => !prev.has(k));
+  const removed = [...prev].filter((k) => !got.has(k));
+  if (!added.length && !removed.length) return;
+  u.titles = TITLE_DEFS.map((d) => d.key).filter((k) => got.has(k)); // 정의 순서로 저장
+  if (u.title && !got.has(u.title)) u.title = null; // 압수된 칭호는 장착 해제 (조용히)
+  const conns = connsOf(userId);
+  if (added.length) {
+    if (conns.length) for (const q of conns) for (const k of added) sendTitleGrant(q, k);
+    else u.titleNews = [...(u.titleNews || []), ...added]; // 오프라인 → 다음 로그인 때 알림
+  }
+  persistUser(userId);
+  for (const q of conns) sendTitlesInfo(q);
+  broadcastTitleOf(userId); // 장착 변화(회수 해제 포함)를 인게임 이름표에 반영
+}
+function recomputeAllTitles() { for (const uid in users) recomputeTitles(uid); } // 기록/순위 변동은 전원에 영향
+
+function sendTitleGrant(p, key) {
+  const d = TITLE_BY_KEY[key];
+  if (d) send(p, { type: "titleGrant", key, name: d.name, rar: d.rar });
+}
+// 칭호 패널 데이터 : 전체 정의 + 보유 여부 + 장착
+function sendTitlesInfo(p) {
+  if (!p.account || !users[p.account.userId]) return;
+  const u = users[p.account.userId];
+  const owned = new Set(Array.isArray(u.titles) ? u.titles : []);
+  send(p, {
+    type: "titlesInfo",
+    defs: TITLE_DEFS.map((d) => ({ key: d.key, name: d.name, cond: d.cond, rar: d.rar, got: owned.has(d.key) })),
+    equipped: u.title || null,
+  });
+}
+// 장착 칭호를 모두에게 방송 (인게임 이름표 아래 표시용 — pid 기준)
+function broadcastTitleOf(userId) {
+  if (!userId || !users[userId]) return;
+  const d = users[userId].title ? TITLE_BY_KEY[users[userId].title] : null;
+  for (const [pid, q] of players) {
+    if (!q.account || q.account.userId !== userId) continue;
+    broadcastConnected({ type: "playerTitle", pid, title: d ? d.name : null, rar: d ? d.rar : null });
+  }
+}
+// 입장자에게 현재 접속자들의 장착 칭호 일람 전송
+function sendTitlesMap(p) {
+  const entries = [];
+  for (const [pid, q] of players) {
+    if (!q.account) continue;
+    const u = users[q.account.userId];
+    const d = u && u.title ? TITLE_BY_KEY[u.title] : null;
+    if (d) entries.push({ pid, title: d.name, rar: d.rar });
+  }
+  if (entries.length) send(p, { type: "titlesMap", entries });
+}
+
+// 관리자 명령 인자 파싱 : 큰따옴표로 감싸면 띄어쓰기 포함 닉네임도 한 인자로 취급.
+//  예) /닉변 "김 승찬" "새 닉네임"   /추방 "우주 최강"   (따옴표 없으면 기존처럼 공백 분리)
+function parseArgs(text) {
+  const out = [];
+  const re = /"([^"]*)"|(\S+)/g;
+  let m;
+  while ((m = re.exec(text))) out.push(m[1] !== undefined ? m[1] : m[2]);
+  return out;
+}
+
+// 관리자 /어디 : 유저가 지금 뭘 하는지 조회. 인자 없으면 전체 온라인 현황.
+//  /어디            → 접속자 전원의 활동
+//  /어디 닉네임 …    → 해당 계정들의 활동 (미접속=오프라인, 아이디 폴백, 온라인 게스트 이름도 조회)
+function handleWhereCommand(p, text) {
+  const reply = (t) => send(p, { type: "chat", id: 0, name: "시스템", text: t, t: Date.now() });
+  const names = parseArgs(text).slice(1);
+  const lines = [];
+  if (!names.length) {
+    for (const [, q] of players) {
+      const who = q.account ? `${q.account.nickname}(${q.account.userId})` : guestLabel(q.name);
+      lines.push(`${who}: ${activityOf(q)}`);
+    }
+    if (!lines.length) { reply("접속자가 없습니다."); return; }
+  } else {
+    for (const name of names) {
+      const matches = findUserIdsByName(name);
+      if (matches.length) {
+        for (const id of matches) {
+          let found = null;
+          for (const [, q] of players) if (q.account && q.account.userId === id) { found = q; break; }
+          lines.push(`${users[id].nickname || id}: ${found ? activityOf(found) : "오프라인"}`);
+        }
+        continue;
+      }
+      // 계정에 없는 이름 → 온라인 게스트 이름으로 조회 (게스트 이름은 중복 가능 → 전부 표시)
+      const guests = [];
+      for (const [, q] of players) if (!q.account && (q.name || "").toLowerCase() === String(name).toLowerCase()) guests.push(q);
+      if (guests.length) { for (const g of guests) lines.push(`${guestLabel(g.name)}: ${activityOf(g)}`); continue; }
+      lines.push(`${name}: 없는 닉네임`);
+    }
+  }
+  // 채팅 한 줄이 너무 길지 않게 ~160자씩 끊어 보낸다
+  let cur = "";
+  for (const line of lines) {
+    if (cur && cur.length + line.length + 3 > 160) { reply(cur); cur = line; }
+    else cur = cur ? cur + " / " + line : line;
+  }
+  if (cur) reply(cur);
+}
+
+// 관리자 /온라인 : 접속자 명단만 간단히 (활동까지 보려면 /어디)
+function handleOnlineCommand(p) {
+  const reply = (t) => send(p, { type: "chat", id: 0, name: "시스템", text: t, t: Date.now() });
+  const names = [];
+  for (const [, q] of players) names.push(q.account ? q.account.nickname : guestLabel(q.name));
+  if (!names.length) { reply("접속자가 없습니다."); return; }
+  let cur = `온라인 ${names.length}명: `;
+  for (const n of names) {
+    if (cur.length + n.length + 2 > 160) { reply(cur.replace(/, $/, "")); cur = ""; }
+    cur += n + ", ";
+  }
+  reply(cur.replace(/, $/, ""));
+}
+
+// 관리자 /추방 : 접속 중인 유저를 즉시 퇴장 (계정 닉네임 우선, 게스트 이름도 가능. 차단은 아님 — 재접속 가능)
+function handleKickCommand(p, text) {
+  const reply = (t) => send(p, { type: "chat", id: 0, name: "시스템", text: t, t: Date.now() });
+  const names = parseArgs(text).slice(1);
+  if (!names.length) { reply("사용법: /추방 닉네임 …  (영구 차단은 /차단)"); return; }
+  const done = [], missing = [];
+  for (const name of names) {
+    const ids = new Set(findUserIdsByName(name));
+    let kicked = 0;
+    for (const [, q] of players) {
+      if (q === p) continue; // 자기 자신 제외
+      const hit = q.account ? ids.has(q.account.userId)
+        : (q.name || "").toLowerCase() === String(name).toLowerCase(); // 게스트는 온라인 이름 일치(중복 시 전부)
+      if (hit) { kickPlayer(q, "관리자에 의해 연결이 종료되었습니다."); kicked++; }
+    }
+    if (kicked) done.push(`${name}(${kicked}명)`); else missing.push(name);
+  }
+  let out = done.length ? `추방 완료: ${done.join(", ")}` : "";
+  if (missing.length) out += `${out ? " / " : ""}접속 중이 아님: ${missing.join(", ")}`;
+  reply(out);
+}
+
+// 관리자 /차단 /차단해제 : 계정 로그인 자체를 막는다 (banned 컬럼). 차단 시 접속 중이면 즉시 추방.
+//  게스트는 계정이 없어 차단 불가 → /추방으로 내보내기만 가능.
+function handleBanCommand(p, text, on) {
+  const reply = (t) => send(p, { type: "chat", id: 0, name: "시스템", text: t, t: Date.now() });
+  const names = parseArgs(text).slice(1);
+  if (!names.length) { reply(`사용법: ${on ? "/차단" : "/차단해제"} 닉네임 …`); return; }
+  const done = [], missing = [], dup = [], denied = [];
+  for (const name of names) {
+    const matches = findUserIdsByName(name);
+    if (!matches.length) { missing.push(name); continue; }
+    if (matches.length > 1) { dup.push(`${name}(${matches.join(",")})`); continue; } // 옛 중복 닉 → 아이디로 지정 요청
+    const id = matches[0], u = users[id];
+    if (id === ADMIN_ID) { denied.push(name); continue; } // 관리자 계정은 차단 불가
+    if (on) u.banned = true; else delete u.banned;
+    persistUser(id);
+    done.push(u.nickname || id);
+    if (on) for (const [, q] of players) if (q.account && q.account.userId === id) kickPlayer(q, "차단된 계정입니다.");
+  }
+  let out = done.length ? `${on ? "차단" : "차단 해제"} 완료 ${done.length}명: ${done.join(", ")}` : "";
+  if (missing.length) out += `${out ? " / " : ""}없는 닉네임: ${missing.join(", ")}`;
+  if (dup.length) out += `${out ? " / " : ""}닉 중복(아이디로 지정하세요): ${dup.join(", ")}`;
+  if (denied.length) out += `${out ? " / " : ""}관리자 차단 불가: ${denied.join(", ")}`;
+  reply(out);
+}
+
+function handleBanListCommand(p) {
+  const reply = (t) => send(p, { type: "chat", id: 0, name: "시스템", text: t, t: Date.now() });
+  const banned = Object.keys(users).filter((id) => users[id].banned === true).map((id) => users[id].nickname || id);
+  reply(banned.length ? `차단 ${banned.length}명: ${banned.join(", ")}` : "차단된 계정이 없습니다.");
+}
+
+// 관리자 /기록삭제 : 특정 계정의 코스 최고기록을 삭제 (인게임 TOP10/로비 랭킹에서 빠진다).
+//  /기록삭제 닉네임 코스 …   코스 = A-1~A-3, B-1~B-3, C-1~C-3, 레트로1, 레트로2, 전체
+const COURSE_LABEL = { a1: "A-1", a2: "A-2", a3: "A-3", racing: "B-1", hard: "B-2", serp: "B-3", c1: "C-1", c2: "C-2", c3: "C-3", d1: "D-1", retro1: "레트로1", retro2: "레트로2", boss: "보스전" };
+function courseModeOf(token) {
+  const t = String(token || "").toLowerCase().replace(/-/g, "");
+  const map = { a1: "a1", a2: "a2", a3: "a3", b1: "racing", b2: "hard", b3: "serp", c1: "c1", c2: "c2", c3: "c3", d1: "d1", "레트로1": "retro1", "레트로2": "retro2", "보스전": "boss", "보스": "boss" };
+  return map[t] || null;
+}
+function handleRecordDeleteCommand(p, text) {
+  const reply = (t) => send(p, { type: "chat", id: 0, name: "시스템", text: t, t: Date.now() });
+  const parts = parseArgs(text).slice(1);
+  if (parts.length < 2) { reply("사용법: /기록삭제 닉네임 코스 …  (코스: A-1~C-3, 레트로1, 레트로2, 전체)"); return; }
+  const name = parts[0];
+  const matches = findUserIdsByName(name);
+  if (!matches.length) { reply(`없는 닉네임: ${name}`); return; }
+  if (matches.length > 1) { reply(`닉 중복(아이디로 지정하세요): ${name}(${matches.join(",")})`); return; }
+  const id = matches[0], u = users[id];
+  // 코스 목록 : "전체" 면 모든 코스, 아니면 토큰별 해석 (모르는 코스는 따로 안내)
+  const unknown = [];
+  let modes;
+  if (parts.slice(1).some((t) => t === "전체")) modes = Object.keys(COURSE_LABEL);
+  else {
+    modes = [];
+    for (const tk of parts.slice(1)) {
+      const m = courseModeOf(tk);
+      if (m) modes.push(m); else unknown.push(tk);
+    }
+  }
+  const fmt = (ms) => (ms / 1000).toFixed(2) + "초";
+  const deleted = [], none = [];
+  for (const mode of modes) {
+    const field = RECORD_FIELD[mode];
+    if (u[field]) {
+      deleted.push(`${COURSE_LABEL[mode]}(${fmt(u[field])})`);
+      delete u[field];
+      broadcastRecords(mode); // 해당 코스 인게임 TOP10 즉시 갱신
+    } else none.push(COURSE_LABEL[mode]);
+  }
+  if (deleted.length) {
+    persistUser(id);
+    for (const [, p2] of players) if (p2.account && p2.account.userId === id) { sendStats(p2); break; } // 접속 중이면 개인 기록 갱신
+    recomputeAllTitles(); // 기록 삭제로 순위가 당겨진 유저까지 재판정
+  }
+  let out = deleted.length ? `${u.nickname || id} 기록 삭제 완료: ${deleted.join(", ")}` : "";
+  if (none.length && parts[1] !== "전체") out += `${out ? " / " : ""}기록 없음: ${none.join(", ")}`;
+  if (!deleted.length && !out) out = "삭제할 기록이 없습니다.";
+  if (unknown.length) out += `${out ? " / " : ""}모르는 코스: ${unknown.join(", ")} (A-1~C-3, 레트로1, 레트로2, 전체)`;
+  reply(out);
+}
+
+// 관리자 /닉변 : 계정 닉네임 변경 — 파일/DB 직접 수정 금지(서버 메모리 캐시가 덮어씀), 반드시 이 명령으로.
+//  /닉변 대상닉네임|아이디 새닉네임   (새 닉은 12자 제한 + 계정 간 중복 금지, 회원가입과 동일 규칙)
+function handleRenameCommand(p, text) {
+  const reply = (t) => send(p, { type: "chat", id: 0, name: "시스템", text: t, t: Date.now() });
+  const parts = parseArgs(text);
+  if (parts.length < 3) { reply('사용법: /닉변 대상닉네임 새닉네임 — 띄어쓰기 있는 닉은 "따옴표"로 묶기'); return; }
+  const target = parts[1];
+  const matches = findUserIdsByName(target);
+  if (!matches.length) { reply(`없는 닉네임: ${target}`); return; }
+  if (matches.length > 1) { reply(`닉 중복(아이디로 지정하세요): ${target}(${matches.join(",")})`); return; }
+  const id = matches[0], u = users[id];
+  if (!String(parts[2] || "").trim()) { reply("새 닉네임을 입력하세요."); return; }
+  const nick = sanitizeName(parts[2]);
+  const taken = Object.keys(users).some((uid) => uid !== id && (users[uid].nickname || "").toLowerCase() === nick.toLowerCase());
+  if (taken) { reply(`이미 사용 중인 닉네임입니다: ${nick}`); return; }
+  const old = u.nickname || id;
+  u.nickname = nick;
+  persistUser(id);
+  // 접속 중이면 서버 쪽 표시(채팅/순위/릴레이 이름)도 즉시 반영 + 본인에게 안내
+  for (const [, q] of players) {
+    if (q.account && q.account.userId === id) {
+      q.account.nickname = nick; q.name = nick;
+      send(q, { type: "chat", id: 0, name: "시스템", text: `닉네임이 "${nick}"(으)로 변경되었습니다. 새로고침하면 화면에 적용됩니다.`, t: Date.now() });
+    }
+  }
+  reply(`닉변 완료: ${old} → ${nick}`);
+}
+
+// 관리자 /점수초기화 : 경쟁전 점수를 기본(100)으로 리셋. 전적(승/판)은 유지.
+//  /점수초기화 전체        → 모든 계정
+//  /점수초기화 닉네임 …    → 해당 계정만 (아이디 폴백 허용)
+function handleScoreResetCommand(p, text) {
+  const reply = (t) => send(p, { type: "chat", id: 0, name: "시스템", text: t, t: Date.now() });
+  const names = parseArgs(text).slice(1);
+  if (!names.length) { reply("사용법: /점수초기화 전체  또는  /점수초기화 닉네임1 닉네임2 …"); return; }
+  const resetOne = (id) => {
+    delete users[id].rankScore; // rankScoreOf 폴백 = 기본 100점
+    persistUser(id);
+    // 접속 중이면 대시보드 점수 즉시 갱신
+    for (const [, p2] of players) if (p2.account && p2.account.userId === id) { sendStats(p2); break; }
+    recomputeTitles(id); // 에이스/챔피언 회수 재판정
+  };
+  if (names.length === 1 && names[0] === "전체") {
+    let cnt = 0;
+    for (const id in users) if (typeof users[id].rankScore === "number") { resetOne(id); cnt++; }
+    reply(cnt ? `전체 점수 초기화 완료: ${cnt}명 → 100점 (전적은 유지)` : "초기화할 점수가 없습니다 (전원 기본 100점).");
+    return;
+  }
+  const done = [], missing = [], dup = [];
+  for (const name of names) {
+    const matches = findUserIdsByName(name);
+    if (!matches.length) { missing.push(name); continue; }
+    if (matches.length > 1) { dup.push(`${name}(${matches.join(",")})`); continue; } // 옛 중복 닉 → 아이디로 지정 요청
+    resetOne(matches[0]);
+    done.push(users[matches[0]].nickname || matches[0]);
+  }
+  let out = done.length ? `점수 초기화 완료 ${done.length}명 → 100점: ${done.join(", ")}` : "";
+  if (missing.length) out += `${out ? " / " : ""}없는 닉네임: ${missing.join(", ")}`;
+  if (dup.length) out += `${out ? " / " : ""}닉 중복(아이디로 지정하세요): ${dup.join(", ")}`;
+  reply(out);
+}
+
+// 관리자 /이벤트 : 유저에게 이벤트 선물 발송 — 받는 유저는 수령 전까지 접속/로비마다 팝업을 본다.
+//  /이벤트 닉네임 선물이름 메세지…   (선물 이름의 공백 허용 : 공백을 제거해 GIFT_ITEMS 와 매칭)
+function handleEventCommand(p, text) {
+  const reply = (t) => send(p, { type: "chat", id: 0, name: "시스템", text: t, t: Date.now() });
+  const parts = parseArgs(text).slice(1);
+  if (parts.length < 2) { reply(`사용법: /이벤트 닉네임 선물이름 메세지 (선물: ${Object.keys(GIFT_ITEMS).join(", ")})`); return; }
+  const name = parts[0];
+  const matches = findUserIdsByName(name);
+  if (!matches.length) { reply(`없는 닉네임: ${name} (게스트에겐 보낼 수 없습니다)`); return; }
+  if (matches.length > 1) { reply(`닉 중복(아이디로 지정하세요): ${name}(${matches.join(",")})`); return; }
+  // 선물 이름 : 남은 토큰을 앞에서부터 공백 없이 이어 붙이며 등록된 이름과 최장 일치
+  const rest = parts.slice(1);
+  let gift = null, used = 0;
+  for (let i = 0, acc = ""; i < rest.length && i < 4; i++) {
+    acc += rest[i];
+    if (GIFT_ITEMS[acc]) { gift = GIFT_ITEMS[acc]; used = i + 1; }
+  }
+  if (!gift) { reply(`알 수 없는 선물: ${rest.join(" ")} (가능: ${Object.keys(GIFT_ITEMS).join(", ")})`); return; }
+  const giftMsg = rest.slice(used).join(" ").slice(0, 200);
+  const id = matches[0], u = users[id];
+  const replaced = !!u.gift; // 미수령 선물이 이미 있으면 새 선물로 교체
+  u.gift = { item: gift.item, msg: giftMsg, at: Date.now() };
+  persistUser(id);
+  // 접속 중이면 즉시 팝업
+  for (const [, q] of players) if (q.account && q.account.userId === id) send(q, { type: "gift", msg: giftMsg });
+  reply(`${u.nickname || id}님에게 선물을 보냈습니다.${replaced ? " (미수령 선물을 교체)" : ""}`);
+}
+
+// 매치메이킹 종료(경쟁전/일반전) : 우승자(완주 우선 순위 1위) 확정 → 점수·전적 → 결과 통지 → 방 해산.
+//  일반전은 delta/score 없이 등수만 담아 보낸다 → 클라가 점수 줄 없는 결과 화면을 띄운다.
+function endMatchRace(roomId, room) {
+  const casual = room.type === "casual";
+  const ranked = rankedRoom(roomId);
+  const winnerId = ranked.length ? ranked[0].id : null;
+  // 남아있는 멤버는 완주/진행도 순 등수, 중도 탈주자는 placeMap 에 없음 → 최하위
+  const placeMap = new Map(ranked.map((e) => [e.id, e.rank]));
+  const results = casual ? applyCasualStats(room, placeMap) : applyRankScores(room, placeMap);
+  for (const { id, p } of roomMembers(roomId)) {
+    const d = results.get(id);
+    if (d) {
+      send(p, casual
+        ? { type: "rankResult", casual: true, win: id === winnerId, place: d.place, n: room.startN }
+        : { type: "rankResult", win: id === winnerId, place: d.place, delta: d.delta, score: d.score, n: room.startN });
+    }
+    if (p.account) sendStats(p); // 대시보드 점수/전적 갱신
+    p.roomId = null; p.active = false; p.state = null; p.matchType = null; p.ready = false;
+  }
+  rooms.delete(roomId);
+  console.log(`[>] ${room.type} room ${roomId} finished (winner ${winnerId}, ${room.startN} players)`);
+}
+
+function proTick() {
+  const now = Date.now();
+  for (const rid of [...rooms.keys()]) {
+    const room = rooms.get(rid);
+    if (!room) continue;
+    if (room.state === "countdown") {
+      if (now >= room.countdownAt) {
+        room.state = "racing";
+        if (!room.startTick) room.startTick = serverTick; // 계획 틱 유지 (카운트다운서 설정)
+        // 타이머 기준을 "입력이 실제 해제된 틱"(startTick)으로 정렬 — 5Hz 플립의 0~200ms 오차 제거
+        room.raceStartAt = now - Math.max(0, (serverTick - room.startTick)) * SIM.TICK_MS;
+        room.raceEndAt = room.timeLimitMs > 0 ? room.raceStartAt + room.timeLimitMs : 0;
+        if (isMatchRoom(room)) { // 시작 멤버/인원 확정 → 점수·전적 배분 기준 (중도 탈주해도 패배 반영)
+          const m = roomMembers(rid);
+          room.startN = m.length;
+          room.starters = m.filter((e) => e.p.account).map((e) => ({ uid: e.p.account.userId, id: e.id }));
+        }
+        const track = TRACKS.pro[room.trackIndex % TRACKS.pro.length];
+        for (const { p } of roomMembers(rid)) {
+          p.lap = 0; p.lapMs = 0; p.prog = 0; p.finished = false; p.finishTime = 0; resetMotion(p);
+          p.lapGate = { checkpoint: false, lastPhase: 0 };
+          // 이미 카운트다운에서 그리드 배치된 멤버는 재스폰 금지 — 초반 런치를 소거하는
+          // 이중 텔레포트 방지. 아직 미배치(랭크 카운트다운 중 합류)만 배치한다.
+          if (!p.state) {
+            const g = SIM.proGridPosition(track, p.slot || 0);
+            spawnSim(p, g.x, g.y, g.angle, 0);
+          }
+        }
+        broadcastRoomList();
+      }
+      broadcastRoom(rid);
+    } else if (room.state === "racing") {
+      if (room.raceEndAt > 0 && now >= room.raceEndAt) endRoomRace(rid);
+      else broadcastRoom(rid);
+    }
+  }
+  broadcastRoomList(); // 브라우저 방 목록 라이브 갱신
+}
+setInterval(proTick, 200); // 5Hz
+
+// 사망 처리 : 죽은 자리 폭발 통지 → 본인은 메뉴로(비활성). 서바이벌 전용.
+function killPlayer(victimId, victim, killerId) {
+  const deathX = victim.state.x, deathY = victim.state.y;
+
+  // 본인에게 사망 통지 → 클라는 모드 선택 화면으로 복귀
+  send(victim, { type: "death" });
+
+  // 같은 모드 플레이어에게 폭발 통지 (죽은 자리, 색은 클라가 victimId 로 계산)
+  broadcastMode("survival", { type: "killed", victimId, killerId, x: deathX, y: deathY });
+
+  // 비활성화 → 스냅샷/판정에서 제외
+  victim.active = false;
+  victim.state = null;
+}
+
+// 랙 보상 : 히스토리에서 t 시각의 위치를 선형 보간해 복원 (없으면 현재 state)
+//  공격자는 상대를 "보간 지연만큼 과거"로 보고 판정하므로, 피격자를 그만큼 되감아 판정해야
+//  공격자 화면과 일치한다. 되감기 상한 120ms — 과도한 되감기(고지연/조작 보고)로 인한 억울사 방지.
+const REWIND_CAP_MS = 120;
+function histAt(p, t) {
+  const h = p.hist;
+  if (!h || !h.length) return p.state;
+  if (t >= h[h.length - 1].t) return h[h.length - 1];
+  if (t <= h[0].t) return h[0];
+  for (let i = h.length - 1; i > 0; i--) {
+    const A = h[i - 1], B = h[i];
+    if (t >= A.t && t <= B.t) {
+      const u = B.t > A.t ? (t - A.t) / (B.t - A.t) : 1;
+      let d = B.angle - A.angle; while (d > Math.PI) d -= Math.PI * 2; while (d < -Math.PI) d += Math.PI * 2;
+      return { x: A.x + (B.x - A.x) * u, y: A.y + (B.y - A.y) * u, angle: A.angle + d * u };
+    }
+  }
+  return p.state;
+}
+// v4 : 상대는 공격자 화면에서 "현재 틱 근처"로 전방시뮬돼 보인다 → 되감기는
+//  잔여 표시 지연(REMOTE_BACKOFF 1틱 + 스무딩)만 보상하면 된다. 자가신고 폐지.
+const rewindOf = () => Math.min(35, REWIND_CAP_MS);
+
+// 충돌 판정 1틱 (서바이벌 모드만)
+function runCollisions() {
+  // 판정 대상 : 활성 + 서바이벌 + 무적 아님
+  const live = [];
+  const now = Date.now();
+  for (const [id, p] of players) {
+    if (!p.active || p.mode !== "survival" || !p.state || p.starved) continue; // 기아 프리즈 = 판정 제외
+    // 머리 궤적(prev→cur) 준비. 텔레포트(과도한 이동)면 스윕 생략.
+    const cur = headOf(p.state);
+    if (!p.prevHead || Math.hypot(cur.x - p.prevHead.x, cur.y - p.prevHead.y) > TELEPORT_DIST) {
+      p.prevHead = cur;
+    }
+    p.curHead = cur;
+    if (now >= (p.invulnUntil || 0)) live.push({ id, p });
+  }
+
+  const dead = new Set();
+  for (let i = 0; i < live.length; i++) {
+    for (let j = i + 1; j < live.length; j++) {
+      const A = live[i], B = live[j];
+      if (dead.has(A.id) || dead.has(B.id)) continue;
+
+      // 랙 보상 : 각 공격자의 화면 시점(보간 지연 과거)으로 피격자를 되감아 판정
+      const aHitB = sweptHeadHit(A.p.prevHead, A.p.curHead, histAt(B.p, now - rewindOf(A.p)));
+      const bHitA = sweptHeadHit(B.p.prevHead, B.p.curHead, histAt(A.p, now - rewindOf(B.p)));
+
+      if (aHitB && bHitA) {
+        // 머리끼리 정면충돌 → 둘 다 터진다 (서로가 killer)
+        killPlayer(A.id, A.p, B.id); dead.add(A.id);
+        killPlayer(B.id, B.p, A.id); dead.add(B.id);
+      } else if (aHitB) { killPlayer(B.id, B.p, A.id); dead.add(B.id); }
+      else if (bHitA) { killPlayer(A.id, A.p, B.id); dead.add(A.id); }
+    }
+  }
+
+  // 다음 틱 스윕을 위해 머리 위치 갱신
+  for (const [, p] of players) {
+    if (p.curHead) p.prevHead = p.curHead;
+  }
+}
+
+// (v4) runCollisions 는 통합 틱(doTick)에서 호출된다.
+
+// (v4) 차대차 충돌은 @carparty/sim 시뮬(3단계 활성화)이 담당 — 구 bump 인터벌 삭제.
+
+/* =============================================================================
+ *  보스전 — 서버 권위 AI 몬스터 트럭
+ *  여러 명이 아레나에서 90초 동안 보스에게서 도망쳐 생존하는 협동 모드.
+ *  보스 위치/스킬/킬 판정 전부 서버가 계산 → 조작 불가. 위치는 스냅샷의
+ *  특수 엔트리(id 0)로 중계돼 클라 보간을 그대로 탄다.
+ * ========================================================================== */
+const BOSS_ID = 0;
+const BOSS_ARENA = { w: 3400, h: 2600 };
+// 기둥 : 돌진을 유도해 그로기를 만드는 엄폐물 (클라 렌더/충돌과 동일해야 함)
+//  콜로세움 배치 — 중심 (1700,1300) 타원(1010x760) 위 8개, 22.5도 시작 45도 간격
+const BOSS_PILLARS = [
+  { x: 2633, y: 1591, r: 84 }, { x: 2087, y: 2002, r: 84 },
+  { x: 1314, y: 2002, r: 84 }, { x: 767, y: 1591, r: 84 },
+  { x: 767, y: 1009, r: 84 }, { x: 1314, y: 598, r: 84 },
+  { x: 2087, y: 598, r: 84 }, { x: 2633, y: 1009, r: 84 },
+];
+const BOSS_ROUND_MS = 90000;      // 라운드 (이만큼 생존 = 클리어)
+const BOSS_COUNTDOWN_MS = 5000;   // 라운드 시작 카운트다운
+const BOSS_RESULT_MS = 10000;     // 결과 화면 후 자동 재시작
+const BOSS_LIVES = 3;             // 부활 2회 (너프: 2→3, 세 번째 죽음 = 관전)
+const BOSS_RESPAWN_MS = 2500;
+// 접촉 히트박스 : 시각 차체와 일치하는 복합 OBB (차체 1 + 타이어 4).
+//  단일 큰 사각형은 바퀴 사이 "허리" 옆이나 타이어 사이 정면을 지날 때 허공 킬을 만들었다.
+//  (클라 BOSS_DRAW_SCALE 0.68 기준 : 차체 ±97×±43, 타이어 중심 (±64,±64) 크기 ±44×±29)
+const BOSS_HIT_BOXES = [
+  { ox: 0, oy: 0, hl: 97, hw: 43 },    // 차체 (불바~리어범퍼)
+  { ox: 64, oy: 64, hl: 44, hw: 29 },  // 타이어 4개
+  { ox: 64, oy: -64, hl: 44, hw: 29 },
+  { ox: -64, oy: 64, hl: 44, hw: 29 },
+  { ox: -64, oy: -64, hl: 44, hw: 29 },
+];
+const CAR_HIT_HL = 27.6, CAR_HIT_HW = 13.2; // 플레이어 시각 차체 반길이/반폭 (클라 carHalfExtents 와 동일)
+const BOSS_SPEED = 900;           // 추격 최고 속도 (플레이어 최고속 2667px/s 의 ~34%) — 800→900 살짝 상향
+// 트럭 운동 모델 : 가감속 + 속도에 따라 조향 반경이 커진다 (저속 민첩, 고속 둔중)
+const BOSS_ACCEL = 700;           // 가속 (px/s^2) — 600→700 살짝 상향
+const BOSS_DECEL = 2400;          // 감속 (px/s^2)
+const BOSS_TURN_LO = 3.2;         // 저속 조향 속도 (rad/s)
+const BOSS_TURN_HI = 1.4;         // 최고속 조향 속도 (rad/s) — 급턴으로 따돌릴 수 있게 넉넉한 반경
+const CHARGE_CD = 12000, CHARGE_PREP = 1200, CHARGE_SPEED = 3200, CHARGE_DIST = 1100, CHARGE_RECOVER = 800; // CD 14→12s, 속도 2900→3200 상향
+const GROGGY_MS = 1500;           // 돌진이 벽/기둥에 박히면 그로기 (접촉 킬도 꺼짐 = 보너스 타임)
+const SLAM_CD = 14000, SLAM_PREP = 900, SLAM_RADIUS = 340, SLAM_TRIGGER = 260, SLAM_KNOCK = 760, SLAM_STUN = 1200; // CD 16→14s 상향
+const TIRE_CD = 11000, TIRE_FLIGHT = 1200, TIRE_RADIUS = 78; // CD 13→11s 상향
+const ENRAGE_STEP_MS = 30000, ENRAGE_PER = 0.03, ENRAGE_MAX = 0.3; // 30초마다 +3%, 최대 +30% (상향)
+
+const bossWorld = {
+  state: "idle", // idle | countdown | running | result
+  t0: 0, countdownAt: 0, endAt: 0, nextAt: 0,
+  boss: null,    // { x,y,angle,vx,vy, state, stateUntil, targetId, retargetAt, chargeDir, chargeLeft, cds, teleport }
+  tires: [],     // 공중의 타이어 투척체 { x1,y1, landAt }
+  lastTick: 0,
+};
+
+function bossEntries() { // 보스 모드 접속자 전원 (관전 포함)
+  const out = [];
+  for (const [id, p] of players) if (p.active && p.mode === "boss") out.push({ id, p });
+  return out;
+}
+// 라운드 참가자 중 "판정 대상" (관전 아님 + 부활 대기 아님 + 위치 있음)
+function bossAliveList() {
+  return bossEntries().filter((e) => !e.p.bossSpec && !e.p.bossDeadUntil && e.p.state);
+}
+function broadcastBoss(obj) { broadcastMode("boss", obj); }
+
+// 개인화 동기(5Hz + 상태 전환 시) : 라운드 상태 + 본인 목숨/관전 여부
+function sendBossSync(p) {
+  const now = Date.now();
+  send(p, {
+    type: "bossSync", state: bossWorld.state,
+    bossState: bossWorld.boss ? bossWorld.boss.state : null,
+    countdownMs: bossWorld.state === "countdown" ? Math.max(0, bossWorld.countdownAt - now) : 0,
+    endMs: bossWorld.state === "running" ? Math.max(0, bossWorld.endAt - now) : 0,
+    alive: bossAliveList().length + bossEntries().filter((e) => e.p.bossDeadUntil).length,
+    lives: p.bossLives || 0, spec: !!p.bossSpec,
+    enrage: bossWorld.boss ? bossEnrage(now) : 1,
+  });
+}
+function syncAllBoss() { for (const { p } of bossEntries()) sendBossSync(p); }
+
+function bossEnrage(now) {
+  if (bossWorld.state !== "running") return 1;
+  return 1 + Math.min(ENRAGE_MAX, Math.floor((now - bossWorld.t0) / ENRAGE_STEP_MS) * ENRAGE_PER);
+}
+function bossCdScale(now) { return Math.pow(0.93, Math.floor((now - bossWorld.t0) / 60000)); } // 시간당 쿨감 0.96→0.93 상향
+
+// 플레이어 스폰 : 보스에서 가장 먼 아레나 코너 부근 (약간 랜덤)
+function bossSpawnPos() {
+  const b = bossWorld.boss;
+  const corners = [
+    { x: 500, y: 450 }, { x: BOSS_ARENA.w - 500, y: 450 },
+    { x: 500, y: BOSS_ARENA.h - 450 }, { x: BOSS_ARENA.w - 500, y: BOSS_ARENA.h - 450 },
+  ];
+  let best = corners[0], bd = -1;
+  for (const c of corners) {
+    const d = b ? Math.hypot(c.x - b.x, c.y - b.y) : Math.random() * 1000;
+    if (d > bd) { bd = d; best = c; }
+  }
+  return { x: best.x + (Math.random() - 0.5) * 240, y: best.y + (Math.random() - 0.5) * 200, angle: Math.atan2(BOSS_ARENA.h / 2 - best.y, BOSS_ARENA.w / 2 - best.x) };
+}
+
+function bossRespawnPlayer(id, p, invulnMs) {
+  const s = bossSpawnPos();
+  spawnSim(p, s.x, s.y, s.angle, invulnMs);
+  p.graceUntil = Date.now() + GRACE_MS;
+}
+
+function startBossCountdown(now) {
+  bossWorld.state = "countdown";
+  bossWorld.countdownAt = now + BOSS_COUNTDOWN_MS;
+  bossWorld.tires = [];
+  // 보스 : 위쪽 가장자리에서 진입 (카운트다운 동안 천천히 걸어 들어옴)
+  bossWorld.boss = {
+    x: BOSS_ARENA.w / 2, y: -260, angle: Math.PI / 2, vx: 0, vy: 0,
+    speed: 0, aimAngle: null, // 트럭 운동 모델 (스칼라 속도 + 조준 방향)
+    state: "enter", stateUntil: 0, targetId: null, retargetAt: 0,
+    chargeDir: 0, chargeLeft: 0, teleport: true,
+    cds: { charge: 0, slam: 0, tire: 0 },
+  };
+  // 전원 참가 상태로 리셋 + 재배치
+  for (const [id, p] of players) {
+    if (!p.active || p.mode !== "boss") continue;
+    p.bossSpec = false; p.bossLives = BOSS_LIVES; p.bossDeadUntil = 0; p.bossSurviveMs = 0;
+    bossRespawnPlayer(id, p, BOSS_COUNTDOWN_MS + 1500);
+  }
+  syncAllBoss();
+}
+
+function startBossRound(now) {
+  bossWorld.state = "running";
+  bossWorld.t0 = now;
+  bossWorld.endAt = now + BOSS_ROUND_MS;
+  const b = bossWorld.boss;
+  b.state = "chase";
+  // 첫 스킬은 시차를 두고 (초반 숨 고르기)
+  b.cds.charge = now + 6000; b.cds.slam = now + 4000; b.cds.tire = now + 7000;
+  b.retargetAt = 0;
+  syncAllBoss();
+}
+
+function endBossRound(now) {
+  const cleared = now >= bossWorld.endAt; // 시간 만료 = 생존자 클리어, 전멸 = 조기 종료
+  for (const { id, p } of bossEntries()) {
+    if (p.bossSpec && !p.bossSurviveMs) { sendBossSync(p); continue; } // 라운드 밖 관전자(중간 입장)
+    const survived = p.bossSpec ? (p.bossSurviveMs || 0) : (now - bossWorld.t0);
+    const win = !p.bossSpec && cleared;
+    let best = 0, newBest = false;
+    if (p.account && users[p.account.userId]) {
+      const u = users[p.account.userId];
+      if (win) u.bossClears = (u.bossClears || 0) + 1;
+      if (!u.bestBoss || survived > u.bestBoss) { u.bestBoss = Math.floor(survived); newBest = true; }
+      best = u.bestBoss;
+      persistUser(p.account.userId);
+    }
+    send(p, { type: "bossResult", survivedMs: Math.floor(survived), cleared: win, best, newBest });
+  }
+  bossWorld.state = "result";
+  bossWorld.nextAt = now + BOSS_RESULT_MS;
+  if (bossWorld.boss) bossWorld.boss.state = "chase"; // 결과 화면 동안 배회 없이 정지 상태 유지
+  syncAllBoss();
+  console.log(`[boss] round end (${cleared ? "clear" : "wipe"})`);
+}
+
+function resetBossWorld() {
+  bossWorld.state = "idle"; bossWorld.boss = null; bossWorld.tires = [];
+}
+
+// 보스 이동 공통 : 아레나 경계 + 기둥에 막힘. 반환 = 벽/기둥에 박았는지 (돌진 그로기용)
+function bossMove(b, nx, ny) {
+  let hit = false;
+  const m = 120; // 보스 반쪽 크기 여유
+  if (nx < m) { nx = m; hit = true; }
+  if (nx > BOSS_ARENA.w - m) { nx = BOSS_ARENA.w - m; hit = true; }
+  if (ny < m) { ny = m; hit = true; }
+  if (ny > BOSS_ARENA.h - m) { ny = BOSS_ARENA.h - m; hit = true; }
+  for (const pl of BOSS_PILLARS) {
+    const dx = nx - pl.x, dy = ny - pl.y;
+    const d = Math.hypot(dx, dy), min = pl.r + 100;
+    if (d < min && d > 0.001) { nx = pl.x + (dx / d) * min; ny = pl.y + (dy / d) * min; hit = true; }
+  }
+  b.x = nx; b.y = ny;
+  return hit;
+}
+
+// 표적 : 가장 가까운 생존자. 12초마다(또는 스킬 후) 무작위 재선정 — 한 명만 물고 늘어지지 않게.
+//  표적이 누군지 클라에는 알리지 않는다 (긴장감/심리전).
+function bossPickTarget(b, now) {
+  const alive = bossAliveList();
+  if (!alive.length) { b.targetId = null; return null; }
+  let cur = alive.find((e) => e.id === b.targetId);
+  if (!cur || now >= b.retargetAt) {
+    if (cur && alive.length > 1 && Math.random() < 0.6) {
+      const others = alive.filter((e) => e.id !== b.targetId);
+      cur = others[Math.floor(Math.random() * others.length)];
+    } else if (!cur) {
+      let bd = Infinity;
+      for (const e of alive) {
+        const d = Math.hypot(e.p.state.x - b.x, e.p.state.y - b.y);
+        if (d < bd) { bd = d; cur = e; }
+      }
+    }
+    b.targetId = cur.id;
+    b.retargetAt = now + 12000;
+  }
+  return cur;
+}
+
+function bossNearestAlive(b) {
+  let best = null, bd = Infinity;
+  for (const e of bossAliveList()) {
+    const d = Math.hypot(e.p.state.x - b.x, e.p.state.y - b.y);
+    if (d < bd) { bd = d; best = e; }
+  }
+  return best ? { e: best, d: bd } : null;
+}
+
+// 두 방향성 사각형(OBB)의 겹침 여부 — 분리축 정리(SAT). a,b = {x,y,ang,hl,hw}
+function obbOverlap(a, b) {
+  const aC = Math.cos(a.ang), aS = Math.sin(a.ang);
+  const bC = Math.cos(b.ang), bS = Math.sin(b.ang);
+  const axes = [[aC, aS], [-aS, aC], [bC, bS], [-bS, bC]];
+  const dx = b.x - a.x, dy = b.y - a.y;
+  for (const [x, y] of axes) {
+    const aR = a.hl * Math.abs(x * aC + y * aS) + a.hw * Math.abs(-x * aS + y * aC);
+    const bR = b.hl * Math.abs(x * bC + y * bS) + b.hw * Math.abs(-x * bS + y * bC);
+    if (aR + bR < Math.abs(dx * x + dy * y)) return false; // 분리축 발견 = 안 겹침
+  }
+  return true;
+}
+
+// 보스 포즈 히스토리에서 t 시각의 위치/각도 복원 (킬 랙 보상 — 피해자가 "본" 보스로 판정)
+function bossPoseAt(b, t) {
+  const h = b.hist;
+  if (!h || !h.length) return b;
+  if (t >= h[h.length - 1].t) return h[h.length - 1];
+  if (t <= h[0].t) return h[0];
+  for (let i = h.length - 1; i > 0; i--) {
+    const A = h[i - 1], B = h[i];
+    if (t >= A.t && t <= B.t) {
+      const u = B.t > A.t ? (t - A.t) / (B.t - A.t) : 1;
+      let d = B.angle - A.angle;
+      while (d > Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      return { x: A.x + (B.x - A.x) * u, y: A.y + (B.y - A.y) * u, angle: A.angle + d * u };
+    }
+  }
+  return b;
+}
+
+// 보스(복합 히트박스)와 플레이어 차체(OBB)의 실제 접촉 여부
+function bossHitsCar(pose, st) {
+  const car = { x: st.x, y: st.y, ang: st.angle, hl: CAR_HIT_HL, hw: CAR_HIT_HW };
+  const cos = Math.cos(pose.angle), sin = Math.sin(pose.angle);
+  for (const hb of BOSS_HIT_BOXES) {
+    const cx = pose.x + cos * hb.ox - sin * hb.oy; // 로컬 (전방 ox, 좌우 oy) → 월드
+    const cy = pose.y + sin * hb.ox + cos * hb.oy;
+    if (obbOverlap({ x: cx, y: cy, ang: pose.angle, hl: hb.hl, hw: hb.hw }, car)) return true;
+  }
+  return false;
+}
+
+// 접촉 킬 : 시각과 일치하는 복합 히트박스 + 랙 보상 (그로기/무적 제외)
+//  피해자의 보간 지연만큼 보스를 과거로 되감아 "피해자 화면에서 닿았을 때만" 죽는다.
+function bossContactKills(now) {
+  const b = bossWorld.boss;
+  for (const { id, p } of bossAliveList()) {
+    if (now < (p.invulnUntil || 0)) continue;
+    const pose = bossPoseAt(b, now - rewindOf(p));
+    if (bossHitsCar(pose, p.state)) bossKill(id, p, now);
+  }
+}
+
+function bossKill(id, p, now) {
+  p.bossLives = Math.max(0, (p.bossLives || 0) - 1);
+  broadcastBoss({ type: "bossEvent", kind: "kill", x: p.state.x, y: p.state.y, victimId: id });
+  p.state = null; // 스냅샷/판정에서 제외 (부활 때 spawn 으로 복귀)
+  if (p.bossLives > 0) {
+    p.bossDeadUntil = now + BOSS_RESPAWN_MS;
+    send(p, { type: "bossDeath", lives: p.bossLives, respawnMs: BOSS_RESPAWN_MS });
+  } else {
+    p.bossSpec = true;
+    p.bossSurviveMs = now - bossWorld.t0;
+    send(p, { type: "bossDeath", lives: 0 });
+  }
+  sendBossSync(p);
+}
+
+function bossThrowTires(b, now) {
+  const alive = bossAliveList();
+  if (!alive.length) return;
+  const n = Math.min(1 + Math.floor(alive.length / 3), 3);
+  const picked = [...alive].sort(() => Math.random() - 0.5).slice(0, n);
+  const list = [];
+  for (const e of picked) {
+    const st = e.p.state;
+    // 예측 조준 : 현재 속도로 비행시간만큼 이동한 지점 (+오차)
+    let tx = st.x + (st.vx || 0) * (TIRE_FLIGHT / 1000) + (Math.random() - 0.5) * 90;
+    let ty = st.y + (st.vy || 0) * (TIRE_FLIGHT / 1000) + (Math.random() - 0.5) * 90;
+    tx = Math.max(60, Math.min(BOSS_ARENA.w - 60, tx));
+    ty = Math.max(60, Math.min(BOSS_ARENA.h - 60, ty));
+    bossWorld.tires.push({ x1: tx, y1: ty, landAt: now + TIRE_FLIGHT });
+    list.push({ x0: b.x, y0: b.y, x1: tx, y1: ty, ms: TIRE_FLIGHT });
+  }
+  broadcastBoss({ type: "bossEvent", kind: "tires", tires: list });
+}
+
+function bossUpdateTires(now) {
+  for (let i = bossWorld.tires.length - 1; i >= 0; i--) {
+    const t = bossWorld.tires[i];
+    if (now < t.landAt) continue;
+    for (const { id, p } of bossAliveList()) {
+      if (now < (p.invulnUntil || 0)) continue;
+      if (Math.hypot(p.state.x - t.x1, p.state.y - t.y1) <= TIRE_RADIUS) bossKill(id, p, now);
+    }
+    bossWorld.tires.splice(i, 1);
+  }
+}
+
+function bossDoSlam(b, now) {
+  broadcastBoss({ type: "bossEvent", kind: "slam", x: b.x, y: b.y });
+  for (const { p } of bossAliveList()) {
+    if (now < (p.invulnUntil || 0)) continue;
+    const dx = p.state.x - b.x, dy = p.state.y - b.y;
+    const d = Math.hypot(dx, dy);
+    if (d <= SLAM_RADIUS) {
+      const ux = d > 0.001 ? dx / d : 1, uy = d > 0.001 ? dy / d : 0;
+      if (p.sim) { // v4 : 서버 권위 시뮬에 동일 적용 (클라는 수신 즉시 예측 적용 → 수렴)
+        p.sim.evx += ux * SLAM_KNOCK; p.sim.evy += uy * SLAM_KNOCK;
+        p.sim.stunUntilTick = serverTick + Math.round(SLAM_STUN / SIM.TICK_MS);
+      }
+      send(p, { type: "bossStun", kx: ux * SLAM_KNOCK, ky: uy * SLAM_KNOCK, ms: SLAM_STUN });
+    }
+  }
+}
+
+function bossTick() {
+  const now = Date.now();
+  const dt = bossWorld.lastTick ? Math.min(0.1, (now - bossWorld.lastTick) / 1000) : 1 / 30;
+  bossWorld.lastTick = now;
+  const everyone = bossEntries();
+  if (!everyone.length) { if (bossWorld.state !== "idle") resetBossWorld(); return; }
+
+  if (bossWorld.state === "idle") { startBossCountdown(now); return; }
+
+  if (bossWorld.state === "countdown") {
+    // 진입 연출 : 부드럽게 가속해 들어와 목표 지점 앞에서 감속 정지
+    const b = bossWorld.boss;
+    const px = b.x, py = b.y;
+    const cy = BOSS_ARENA.h * 0.32;
+    const remain = cy - b.y;
+    const stopSpeed = Math.sqrt(Math.max(0, 2 * BOSS_DECEL * remain)); // 남은 거리로 정지 가능한 속도
+    const target = Math.min(430, stopSpeed);
+    b.speed = b.speed < target ? Math.min(target, b.speed + 700 * dt) : Math.max(target, b.speed - BOSS_DECEL * dt);
+    b.y = Math.min(cy, b.y + b.speed * dt);
+    b.vx = (b.x - px) / dt; b.vy = (b.y - py) / dt; b.stateAt = now;
+    if (now >= bossWorld.countdownAt) startBossRound(now);
+    return;
+  }
+
+  if (bossWorld.state === "result") {
+    // 결과 화면 : 관성으로 미끄러지다 정지
+    const b = bossWorld.boss;
+    if (b) {
+      const px = b.x, py = b.y;
+      b.speed = Math.max(0, b.speed - BOSS_DECEL * dt);
+      if (b.speed > 0) bossMove(b, b.x + Math.cos(b.angle) * b.speed * dt, b.y + Math.sin(b.angle) * b.speed * dt);
+      b.vx = (b.x - px) / dt; b.vy = (b.y - py) / dt; b.stateAt = now;
+    }
+    if (now >= bossWorld.nextAt) startBossCountdown(now);
+    return;
+  }
+
+  // ---- running : 무거운 트럭 운동 모델 ----
+  //  상태별로 "원하는 방향/속도"만 정하고, 실제 각도·속도는 조향 한계(P 제어,
+  //  속도가 빠를수록 조향 반경 증가)와 가감속 한계로 서서히 따라간다.
+  //  → 제자리 회전/즉시 정지/등속 미끄러짐 같은 부자연스러운 움직임 제거.
+  const b = bossWorld.boss;
+  const enr = bossEnrage(now);
+  const cdScale = bossCdScale(now);
+  const px = b.x, py = b.y;
+  const wrapA = (a) => { while (a > Math.PI) a -= Math.PI * 2; while (a < -Math.PI) a += Math.PI * 2; return a; };
+  let wantAngle = b.angle, wantSpeed = 0, steerRate = 1;
+
+  if (b.state === "chase") {
+    const target = bossPickTarget(b, now);
+    if (target) {
+      const st = target.p.state;
+      const d = Math.hypot(st.x - b.x, st.y - b.y);
+      // 리드 추격 : 목표의 예상 위치를 "살짝만" 조준 — 과하면 도주 방향을 미리 막아 사기처럼 느껴진다
+      const lead = Math.min(0.28, d / Math.max(400, BOSS_SPEED * enr) * 0.55);
+      // 코앞(<=130px)에선 조준 갱신 정지 — 표적 각이 요동쳐 제자리에서 맴도는 것 방지
+      if (d > 130) b.aimAngle = Math.atan2(st.y + (st.vy || 0) * lead - b.y, st.x + (st.vx || 0) * lead - b.x);
+      wantAngle = (b.aimAngle != null) ? b.aimAngle : b.angle;
+      // 급코너일수록 감속해 돌고, 정렬되면 풀스피드 (최저 18%) — 급턴 따돌리기가 통하는 여지
+      const align = Math.max(0, Math.cos(wrapA(wantAngle - b.angle)));
+      wantSpeed = BOSS_SPEED * enr * (0.18 + 0.82 * align);
+
+      // 스킬 판단 (타이어는 추격 중에도 병행)
+      if (now >= b.cds.tire) { bossThrowTires(b, now); b.cds.tire = now + TIRE_CD * cdScale; }
+      const near = bossNearestAlive(b);
+      if (now >= b.cds.slam && near && near.d <= SLAM_TRIGGER) {
+        b.state = "slamPrep"; b.stateUntil = now + SLAM_PREP;
+        broadcastBoss({ type: "bossEvent", kind: "slamPrep", x: b.x, y: b.y, ms: SLAM_PREP });
+      } else if (now >= b.cds.charge) {
+        // 표적의 예측 위치로 돌진 방향 고정
+        const clead = Math.min(1.0, CHARGE_PREP / 1000);
+        const ax = st.x + (st.vx || 0) * clead, ay = st.y + (st.vy || 0) * clead;
+        b.chargeDir = Math.atan2(ay - b.y, ax - b.x);
+        b.state = "chargePrep"; b.stateUntil = now + CHARGE_PREP;
+        broadcastBoss({ type: "bossEvent", kind: "chargePrep", x: b.x, y: b.y, dir: b.chargeDir, ms: CHARGE_PREP, dist: CHARGE_DIST });
+      }
+    } else {
+      wantSpeed = 0; // 표적 없음(전원 부활 대기 등) : 관성으로 미끄러지다 정지
+    }
+  } else if (b.state === "chargePrep") {
+    wantAngle = b.chargeDir; wantSpeed = 0; steerRate = 1.6; // 제자리 예열 — 빠르게 조준 방향으로
+    if (now >= b.stateUntil) {
+      b.state = "charge"; b.chargeLeft = CHARGE_DIST; b.angle = b.chargeDir;
+      broadcastBoss({ type: "bossEvent", kind: "charge", x: b.x, y: b.y, dir: b.chargeDir });
+    }
+  } else if (b.state === "charge") {
+    // 런지 : 급가속 램프 (~0.2초에 최고속) 후 직선 대시. 방향 고정.
+    wantAngle = b.chargeDir; wantSpeed = 0; // (아래에서 별도 처리)
+    b.speed = Math.min(CHARGE_SPEED * enr, b.speed + 16000 * dt);
+    const step = b.speed * dt;
+    const hit = bossMove(b, b.x + Math.cos(b.chargeDir) * step, b.y + Math.sin(b.chargeDir) * step);
+    b.chargeLeft -= step;
+    if (hit) {
+      b.speed = 0; // 벽/기둥에 쾅 — 즉시 정지
+      b.state = "groggy"; b.stateUntil = now + GROGGY_MS;
+      b.cds.charge = now + CHARGE_CD * cdScale;
+      broadcastBoss({ type: "bossEvent", kind: "groggy", x: b.x, y: b.y, ms: GROGGY_MS });
+    } else if (b.chargeLeft <= 0) {
+      b.state = "recover"; b.stateUntil = now + CHARGE_RECOVER; // 미끄러지며 감속 (아래 recover)
+      b.cds.charge = now + CHARGE_CD * cdScale;
+    }
+  } else if (b.state === "slamPrep") {
+    wantSpeed = 0; steerRate = 0; // 들어올리는 동안 조향 없음
+    if (now >= b.stateUntil) {
+      bossDoSlam(b, now);
+      b.state = "recover"; b.stateUntil = now + 600;
+      b.cds.slam = now + SLAM_CD * cdScale;
+    }
+  } else if (b.state === "recover" || b.state === "groggy") {
+    wantSpeed = 0; steerRate = 0; // 관성 감속만 (돌진 후엔 스키드로 자연 정지)
+    if (now >= b.stateUntil) b.state = "chase";
+  }
+
+  // ---- 공통 조향 : P 제어 + 속도 비례 조향 반경 (돌진 중엔 방향 고정) ----
+  if (b.state !== "charge" && steerRate > 0) {
+    const da = wrapA(wantAngle - b.angle);
+    const speedFrac = Math.min(1, b.speed / (BOSS_SPEED * enr));
+    const maxTurn = (BOSS_TURN_LO - (BOSS_TURN_LO - BOSS_TURN_HI) * speedFrac) * enr * steerRate;
+    b.angle = wrapA(b.angle + Math.max(-maxTurn, Math.min(maxTurn, da * 5)) * dt);
+  }
+  // ---- 공통 가감속 + 이동 (돌진은 위에서 직접 이동) ----
+  if (b.state !== "charge") {
+    b.speed = b.speed < wantSpeed
+      ? Math.min(wantSpeed, b.speed + BOSS_ACCEL * dt)
+      : Math.max(wantSpeed, b.speed - BOSS_DECEL * dt);
+    if (b.speed > 0) bossMove(b, b.x + Math.cos(b.angle) * b.speed * dt, b.y + Math.sin(b.angle) * b.speed * dt);
+  }
+
+  // 스냅샷용 속도 (클라 보간 피드포워드) + 진짜 샘플 시각 (플레이어 clientT 와 동일 역할 —
+  //  브로드캐스트 시각 대신 이 값을 쓰면 클라가 중복 샘플을 걸러내 재생이 부드럽다)
+  b.vx = (b.x - px) / dt; b.vy = (b.y - py) / dt;
+  b.stateAt = now;
+  // 포즈 히스토리 (~400ms) — 접촉 킬 랙 보상용
+  if (!b.hist) b.hist = [];
+  b.hist.push({ t: now, x: b.x, y: b.y, angle: b.angle });
+  while (b.hist.length > 2 && b.hist[0].t < now - 400) b.hist.shift();
+
+  // 접촉 킬 (그로기 동안은 안전 = 보너스 타임)
+  if (b.state !== "groggy") bossContactKills(now);
+  bossUpdateTires(now);
+
+  // 부활 처리
+  for (const [id, p] of players) {
+    if (p.active && p.mode === "boss" && p.bossDeadUntil && now >= p.bossDeadUntil) {
+      p.bossDeadUntil = 0;
+      bossRespawnPlayer(id, p, 2000);
+      sendBossSync(p);
+    }
+  }
+
+  // 종료 : 시간 만료 또는 전멸(부활 대기도 없음)
+  const inRound = bossEntries().filter((e) => !e.p.bossSpec);
+  if (now >= bossWorld.endAt || inRound.length === 0) endBossRound(now);
+}
+setInterval(bossTick, 1000 / 60); // 60Hz — 플레이어 송신율과 동일한 샘플 밀도 (부드러운 보간)
+setInterval(syncAllBoss, 200); // 5Hz 상태 동기 (타이머/인원 갱신)
+
+// (v4) 구 브로드캐스트 루프 삭제 — 통합 60Hz 틱(doTick)의 MSG_SNAP4 가 대체한다.
+
+// 스모 주먹 히트 판정 (서버 권위 넉백) : 활성 주먹의 글러브 위치를 매 틱 계산해
+//  다른 스모 차와 겹치면 상대에게 sumoKnock(임펄스)을 보낸다. 주먹당 1회만 명중.
+function sumoTick() {
+  const now = Date.now();
+  const list = [];
+  for (const [id, p] of players) if (p.active && p.mode === "sumo" && p.state && !p.starved) list.push({ id, p }); // 기아 프리즈 = 판정 제외
+  for (const { id, p } of list) {
+    if (!p.punchStart || p.punchHit || now > p.punchStart + PUNCH_EXTEND_MS + PUNCH_HOLD_MS) continue;
+    const t = now - p.punchStart;
+    const reach = PUNCH_REACH * Math.min(1, t / PUNCH_EXTEND_MS); // 뻗는 동안 선형 → 유지
+    const gx = p.state.x + Math.cos(p.state.angle) * (PUNCH_FRONT + reach);
+    const gy = p.state.y + Math.sin(p.state.angle) * (PUNCH_FRONT + reach);
+    for (const o of list) {
+      if (o.id === id || now < (o.p.invulnUntil || 0)) continue;
+      const d = Math.hypot(gx - o.p.state.x, gy - o.p.state.y);
+      if (d < PUNCH_HIT_R + CAR_LEN / 2) {
+        let ux = o.p.state.x - p.state.x, uy = o.p.state.y - p.state.y;
+        const n = Math.hypot(ux, uy) || 1; ux /= n; uy /= n; // 주먹 주인 → 상대 방향으로 날림
+        const kvx = Math.round(ux * PUNCH_KNOCK), kvy = Math.round(uy * PUNCH_KNOCK);
+        const spinV = (Math.random() < 0.5 ? -1 : 1) * (5 + Math.random() * 4); // 서버가 난수 결정(결정론)
+        // 서버 시뮬 권위 적용 : ev 채널 + 주행속도 제거 + 입력락
+        const vs = o.p.sim;
+        if (vs) {
+          vs.evx += kvx; vs.evy += kvy;
+          vs.vx = 0; vs.vy = 0; vs.lf = 0; vs.ll = 0;
+          vs.spinV = spinV;
+          vs.lockUntilTick = serverTick + SIM.SUMO.lockTicks;
+        }
+        send(o.p, { type: "sumoKnock", vx: kvx, vy: kvy, spinV, tick: serverTick });
+        p.punchHit = true;
+        break;
+      }
+    }
+  }
+}
+// (v4) sumoTick 은 통합 틱(doTick)에서 호출된다.
+
+// 접속 중인 로그인 유저의 평생 접속 시간을 주기적으로 누적 저장(1분마다).
+//  (연결이 오래 유지돼도 중간중간 반영되도록 — 크래시/강제종료 대비)
+setInterval(() => {
+  for (const [, p] of players) {
+    flushConnectedTime(p);
+    // 칭호 : 접속 중 누적 시간/자정 넘김(연속 접속)으로 조건이 바뀔 수 있어 주기 재판정
+    if (p.account && users[p.account.userId]) { bumpStreak(users[p.account.userId]); recomputeTitles(p.account.userId); }
+    if (p.account && p.ws.readyState === p.ws.OPEN) sendStats(p); // 대시보드 실시간 갱신(접속시간·마지막접속)
+  }
+}, 60000);
+
+// 계정 캐시를 적재하고 토큰 인덱스를 구성한 뒤 서버를 연다
+hydrateUsers().then(() => {
+  rebuildTokens();
+  prewarmChatHistory(); // 재시작 후에도 최근 전체 채팅/친구 대화가 보이게 (닉네임 맵이 필요해 계정 적재 뒤에)
+  server.listen(PORT, () => {
+    console.log(`Car game server running at http://localhost:${PORT} (storage: ${useRedis ? "Upstash Redis" : "files"})`);
+  });
+  tickBase = process.hrtime.bigint(); // v4 통합 60Hz 시뮬 루프 시작
+  simLoop();
+});

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>CarParty.io</title>
+  <!-- public/car-icon.svg — 예전에는 같은 그림을 data URI 로 인라인했다 -->
+  <link rel="icon" type="image/svg+xml" href="/car-icon.svg" />
+  <link rel="apple-touch-icon" href="/icon-192.png" />
+  <!-- PWA : 크롬/사파리에서 "앱으로 설치" 가능하게.
+       매니페스트/설치 프롬프트는 최상위 문서에만 걸리므로 여기(셸)에 둔다. -->
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <meta name="theme-color" content="#fdfcf8" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="CarParty" />
+  <style>
+    /* 셸은 프레임을 꽉 채우는 것 말고 하는 일이 없다. 게임 스타일은
+       play.html 쪽 문서(src/styles/style.css)에 들어 있다. */
+    html, body { width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden; background: #111; }
+    #stage { display: block; width: 100%; height: 100%; border: 0; }
+  </style>
+</head>
+<body>
+  <!-- 게임 문서. src 는 셸 스크립트가 붙인다 (?room= 전달 + 캐시버스팅). -->
+  <iframe
+    id="stage"
+    title="CarParty.io"
+    allow="autoplay; fullscreen; clipboard-write; gamepad"
+    referrerpolicy="same-origin"
+    scrolling="no"
+  ></iframe>
+  <script type="module" src="/src/shell.js"></script>
+</body>
+</html>

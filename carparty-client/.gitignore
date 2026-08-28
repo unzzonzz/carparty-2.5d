@@ -1,0 +1,14 @@
+node_modules/
+*.log
+.DS_Store
+.env
+.env.local
+
+# Vite 빌드 산출물
+dist/
+
+# 주의: src/game/sim.js 는 생성물이지만 커밋한다.
+# 서버 repo 없이 이 repo 만 클론해도 빌드되게 하기 위해서다 (scripts/sync-sim.mjs 참고).
+
+# wrangler 로컬 개발 상태 (pages dev)
+.wrangler/

@@ -1,0 +1,17 @@
+{
+  "name": "carparty-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CarParty.io 서버 — WebSocket 릴레이 + 서버 권위 시뮬레이션",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "netbot": "node netbot.js"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.38.0",
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0"
+  }
+}

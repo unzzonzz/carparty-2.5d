@@ -969,6 +969,19 @@ window.addEventListener("keydown", (e) => {
     return;
   }
 
+  // 2.5D 튜닝 : 로비에서 [ ] 로 눕힘 각도를 2도씩 (값은 좌상단 pitch HUD).
+  //  code 가 아니라 key 로 본다 — 자판 배열이 달라도 글쇠에 새겨진 글자와 일치한다.
+  if (gameMode === "lobby" && (e.key === "[" || e.key === "]")) {
+    LOBBY_PITCH = clamp(LOBBY_PITCH + (e.key === "]" ? 2 : -2), 0, 72);
+    syncPitch();
+    return;
+  }
+  if (gameMode === "lobby" && e.key === "\\") { // 차량 압출 켜고 끄며 비교 (§차량 압출)
+    CAR_EXTRUDE = CAR_EXTRUDE ? 0 : 9;
+    updatePitchHud();
+    return;
+  }
+
   switch (e.code) {
     case "Space": keys.space = true; e.preventDefault(); break;
     case "KeyM": if (!e.repeat) toggleMute(); break; // 음소거 토글 (길게 눌러도 1회)
@@ -1402,6 +1415,65 @@ function updateSkid(car) {
 
 
 /* =============================================================================
+ *  2.5D 카메라 (로비 전용) — 축측 투영. 바닥을 세로로 눌러 눕히고, 높이는 월드 y 로 세운다.
+ * -----------------------------------------------------------------------------
+ *  왜 축측(소실점 없음)인가 : 진짜 원근은 바닥 격자·트랙을 quad 로 잘게 쪼개 그려야 해서
+ *  이 렌더 경로(경로 하나로 바닥을 통째로 칠하는 구조)에 붙지 않는다. 세로 압축은 월드
+ *  변환에 세로 배율 한 축을 더하는 것뿐이라, 격자·스키드·차·불꽃·링 픽커까지 기존 렌더
+ *  코드가 한 줄도 안 바뀌고 그대로 눕는다.
+ *
+ *  항등식 하나로 정리된다 :
+ *    높이 h 인 물체의 꼭대기는 "월드 좌표에서 h × tanφ 만큼 위(−y)" 에 그린다.
+ *    월드 변환이 세로를 k(=cosφ) 배 누르므로 화면상 높이는 자동으로 h × sinφ 가 된다.
+ *
+ *  pitchDeg 0 은 항등 변환이다 — 로비 밖 모드는 항상 0 이라 종전과 픽셀 단위로 같다.
+ * ========================================================================== */
+const CAM25 = {
+  pitchDeg: 0, // 지금 적용 중인 각도(수직에서 눕힌 정도). 모드마다 syncPitch() 가 정한다
+  k: 1,        // cos φ — 바닥 평면 세로 압축률
+  tan: 0,      // tan φ — 높이 → 월드 y 오프셋
+  sin: 0,      // sin φ — 높이 → 화면 px (= tan × k). 압출 레이어 수를 여기서 뽑는다
+};
+let LOBBY_PITCH = 52;  // 로비 각도. [ ] 키로 2도씩 흔들어 보며 고르는 튜닝값 (44~60 권장)
+const MAX_OBJ_H = 150; // 가장 키 큰 오브젝트(트로피) 높이 — 컬링 상단 여유 계산에 쓴다
+
+/* 차량 압출 높이 (실험, 기본 0=끔). 주변이 전부 부피를 가지면 차만 납작해 보여서
+ *  바디 실루엣을 이만큼 세워 보는 스위치다. 게이트 오브젝트를 먼저 눈으로 확인한 뒤
+ *  \ 키로 켜서 비교하라는 뜻으로 기본값이 0 이다. 켤 땐 9 정도가 맞는다. */
+let CAR_EXTRUDE = 0;
+
+function setPitch(deg) {
+  CAM25.pitchDeg = clamp(deg, 0, 72); // 72°를 넘기면 바닥이 거의 선이 되어 주행 자체가 안 된다
+  const r = CAM25.pitchDeg * Math.PI / 180;
+  CAM25.k = Math.cos(r);
+  CAM25.tan = Math.tan(r);
+  CAM25.sin = Math.sin(r);
+}
+// 모드가 바뀔 때마다 호출 — 로비만 눕고 나머지는 항등(탑뷰)으로 되돌린다.
+function syncPitch() {
+  setPitch(gameMode === "lobby" ? LOBBY_PITCH : 0);
+  updatePitchHud();
+}
+
+/* pitch 표시 : 빌드에서 console 이 제거되므로 값은 화면에 그려서 확인해야 한다.
+ *  React 트리를 건드리지 않으려고 엔진이 직접 만들어 붙인다(App.jsx 의 쌓임 순서 불변).
+ *  튜닝이 끝나면 이 블록과 [ ] 키 두 줄만 지우면 흔적이 남지 않는다. */
+let pitchHudEl = null;
+function updatePitchHud() {
+  if (gameMode !== "lobby") { if (pitchHudEl) pitchHudEl.style.display = "none"; return; }
+  if (!pitchHudEl) {
+    pitchHudEl = document.createElement("div");
+    pitchHudEl.id = "pitchHud";
+    pitchHudEl.style.cssText = "position:fixed;left:16px;top:54px;z-index:60;padding:5px 11px;" +
+      "border-radius:11px;background:rgba(58,54,46,0.66);color:#fdfcf8;pointer-events:none;" +
+      "font:400 15px Jua,sans-serif;letter-spacing:0.02em";
+    document.body.appendChild(pitchHudEl);
+  }
+  pitchHudEl.style.display = "block";
+  pitchHudEl.textContent = `pitch ${CAM25.pitchDeg}°   차압출 ${CAR_EXTRUDE ? "ON" : "OFF"}   [ ] \\`;
+}
+
+/* =============================================================================
  *  카메라 — 차량을 항상 화면 중앙에 두고 맵이 움직인다
  * ========================================================================== */
 // zoom: 배율(클수록 확대). ay: 차가 화면 세로 어느 지점에 오는지(0.5=중앙, 0.36=위쪽).
@@ -1418,10 +1490,13 @@ const camera = { x: 0, y: 0, shake: 0, zoom: 1, zoomT: 1, ay: 0.5, ayT: 0.5 };
 const viewBox = { x0: 0, y0: 0, x1: 0, y1: 0 };
 function updateViewBox() {
   const m = 80; // 여유 — 화면 흔들림 + 오브젝트 반지름 흡수
+  // 2.5D : 세워진 오브젝트는 접지점보다 최대 MAX_OBJ_H×tanφ 만큼 월드 위(−y)로 뻗는다.
+  //  위 여유를 그만큼 더 주지 않으면 키 큰 오브젝트가 화면 위에서 통째로 뚝 사라진다.
+  //  아래/오른쪽은 세로 가시 범위가 1/k 로 늘어난 것만 반영하면 된다.
   viewBox.x0 = camera.x - m;
-  viewBox.y0 = camera.y - m;
+  viewBox.y0 = camera.y - m - MAX_OBJ_H * CAM25.tan;
   viewBox.x1 = camera.x + viewW / camera.zoom + m;
-  viewBox.y1 = camera.y + viewH / camera.zoom + m;
+  viewBox.y1 = camera.y + viewH / (camera.zoom * CAM25.k) + m;
 }
 // r = 오브젝트 반경(월드 px). 이름표/그림자까지 덮도록 호출부에서 넉넉히 준다.
 function inView(x, y, r = 0) {
@@ -1429,6 +1504,12 @@ function inView(x, y, r = 0) {
 }
 // 차 1대가 차지하는 최대 반경 : 차체(~55px) + 이름표 + 칭호 한 줄 (넉넉히)
 const CAR_CULL_R = 90;
+
+/* 화면 px → 월드 좌표. 2.5D 에서는 세로 배율만 다르다(pitch 0 이면 종전과 동일).
+ *  판정은 언제나 "바닥 평면" 기준이다 — 세워진 오브젝트 실루엣을 클릭해도 맞지 않는다.
+ *  프로토타입에서는 문제 삼지 않는다(게이트 바닥 사각형이 그대로 히트박스다). */
+function screenToWorldX(px) { return camera.x + px / camera.zoom; }
+function screenToWorldY(py) { return camera.y + py / (camera.zoom * CAM25.k); }
 
 // 화면 흔들림을 추가한다(상대를 죽였을 때 등). 값이 클수록 세게 흔들림.
 function addShake(amount) {
@@ -1440,7 +1521,8 @@ function updateCamera(car, dt) {
   camera.zoom += (camera.zoomT - camera.zoom) * k;
   camera.ay += (camera.ayT - camera.ay) * k;
   camera.x = car.x - (viewW / 2) / camera.zoom;
-  camera.y = car.y - (viewH * camera.ay) / camera.zoom;
+  // 2.5D : 세로 가시 범위가 1/k 로 늘어났으므로 나눗셈도 같이 눌러야 차가 의도한 ay 지점에 온다
+  camera.y = car.y - (viewH * camera.ay) / (camera.zoom * CAM25.k);
   // 흔들림은 시간에 따라 빠르게 잦아든다(약 0.4초)
   camera.shake *= Math.exp(-9 * dt);
   if (camera.shake < 0.3) camera.shake = 0;
@@ -1499,8 +1581,11 @@ function render(car) {
   const sy = camera.shake ? (Math.random() * 2 - 1) * camera.shake : 0;
 
   ctx.save();
-  ctx.scale(camera.zoom, camera.zoom); // 줌 (로비: 대기 확대 → 주행 줌아웃)
-  ctx.translate(-camera.x + sx / camera.zoom, -camera.y + sy / camera.zoom); // 월드 → 화면 변환 (+흔들림)
+  // 2.5D : 세로만 k 배 더 누른다 (pitch 0 → k=1 → 종전과 완전히 같은 균등 줌).
+  const zy = camera.zoom * CAM25.k;
+  ctx.scale(camera.zoom, zy); // 줌 (로비: 대기 확대 → 주행 줌아웃) + 세로 압축
+  // 흔들림은 화면 px 단위여야 하는데 translate 에는 축별 배율이 곱해진다 → 축마다 제 배율로 나눈다
+  ctx.translate(-camera.x + sx / camera.zoom, -camera.y + sy / zy); // 월드 → 화면 변환 (+흔들림)
 
   drawGround();
   drawSkid();
@@ -1531,15 +1616,22 @@ function render(car) {
   shadowBatch.length = 0;
   for (const r of visibleRemotes) shadowBatch.push(r);
   if (meVisible) shadowBatch.push(car);
-  drawCarShadows(shadowBatch);
+  // 로비는 오브젝트 접지 그림자까지 같은 multiply 배치에 합류시킨다
+  if (gameMode === "lobby") drawLobbyShadows(shadowBatch);
+  else drawCarShadows(shadowBatch);
 
-  if (gameMode === "sumo") {
-    for (const r of visibleRemotes) drawCarPunch(r.x, r.y, r.angle, r.color || colorForId(r.id), r.punchAt); // 원격 주먹(차 밑 마운트)
+  if (gameMode === "lobby") {
+    // 2.5D : 세워진 게이트 오브젝트와 차를 접지점 y 로 한데 정렬해 그린다
+    drawLobbySorted(car, meVisible);
+  } else {
+    if (gameMode === "sumo") {
+      for (const r of visibleRemotes) drawCarPunch(r.x, r.y, r.angle, r.color || colorForId(r.id), r.punchAt); // 원격 주먹(차 밑 마운트)
+    }
+    for (const r of visibleRemotes) drawCar(r, r.color || colorForId(r.id));
+    // 내 차량 (보스전 사망/관전 중엔 숨김)
+    if (gameMode === "sumo" && !sumo.dead) drawCarPunch(car.x, car.y, car.angle, myColor(), sumo.punchAt); // 내 주먹
+    if (meVisible) drawCar(car, myColor());
   }
-  for (const r of visibleRemotes) drawCar(r, r.color || colorForId(r.id));
-  // 내 차량 (보스전 사망/관전 중엔 숨김)
-  if (gameMode === "sumo" && !sumo.dead) drawCarPunch(car.x, car.y, car.angle, myColor(), sumo.punchAt); // 내 주먹
-  if (meVisible) drawCar(car, myColor());
   // 보스 : 설정의 "다른 차 숨김"과 무관하게 항상 보인다
   if (gameMode === "boss") {
     const bent = remotePlayers.get(BOSS_EID);
@@ -3011,8 +3103,383 @@ function drawFlatTrackGround() {
   ctx.stroke();
 }
 
-/* 로비 바닥 : 웜 화이트 + 보일 듯 말 듯한 격자 + 모드 게이트(플랫 컬러 패치).
- *  광원 좌상단 고정 → 게이트 그림자는 우하단 플랫 오프셋(#E9E4D8, 블러 0). */
+/* =============================================================================
+ *  2.5D 압출 렌더러 — 단면을 바닥에서 꼭대기까지 겹겹이 쌓아 부피를 만든다.
+ * -----------------------------------------------------------------------------
+ *  그라데이션도 셰이더도 없이 순수 fill() 반복이라 지금의 플랫 감성이 그대로 남는다.
+ *  단면 반지름을 t 에 따라 바꾸면 원뿔·컵·플라스크 같은 회전체가 공짜로 나온다.
+ *
+ *  오프스크린 베이크(한 번 굽고 drawImage 로 blit)를 안 쓰는 이유 : pitch 를 [ ] 로
+ *  실시간으로 흔들어 보는 게 이 프로토타입의 목적이라, 각도가 바뀔 때마다 전부 다시
+ *  구워야 한다. 각도를 확정한 뒤에 베이크로 바꾸는 것이 순서다 — 오브젝트는 회전도
+ *  애니메이션도 없다(광장 시계 바늘만 예외).
+ * ========================================================================== */
+// 지금 압출의 레이어 간격(t 단위). shadeFn 이 "경계에 걸친 한 겹"만 집을 때 쓴다(플라스크 액면).
+let extrudeStep = 0;
+
+/* 세워진 물체 하나.
+ *  section(t) 은 t(0=바닥, 1=꼭대기) 의 단면을 원점 기준으로 그린다 — ctx 에 경로를
+ *  세우거나(beginPath 포함, fill 은 하지 않는다) 미리 구워 둔 Path2D 를 반환한다.
+ *  반환값을 보는 이유는 굽기를 허용하기 위해서다(CARP·PLAZA_TICKS 와 같은 이유).
+ *  shadeFn(t) 는 라바콘 흰 띠처럼 특정 높이 구간만 색이 다를 때, overlay(t) 는 트로피
+ *  하이라이트처럼 레이어 직후 같은 자리에 덧칠할 때 쓴다. 둘 다 없으면 단색 측면이다.
+ *  호출 시점의 원점 = 물체의 접지점. 월드 변환 안에서 부른다. */
+function extrude(h, section, sideColor, topColor, shadeFn, overlay) {
+  const N = Math.max(12, Math.ceil(h * CAM25.sin * 2)); // 화면 0.5px 간격 → 레이어 계단이 안 보인다
+  const rise = h * CAM25.tan;                           // 꼭대기의 월드 y 오프셋
+  extrudeStep = 1 / (N - 1);
+  ctx.save();
+  let prev = 0;
+  for (let i = 0; i < N; i++) {
+    const t = i * extrudeStep;
+    const y = -rise * t;
+    ctx.translate(0, y - prev); // 겹마다 save/restore 하지 않고 차분만 이동 (100겹 × 2콜을 아낀다)
+    prev = y;
+    ctx.fillStyle = i === N - 1 ? topColor : (shadeFn ? shadeFn(t) : sideColor);
+    const p = section(t);
+    if (p) ctx.fill(p); else ctx.fill();
+    if (overlay) overlay(t);
+  }
+  ctx.restore();
+}
+
+/* 정면 벽 좌표계. 압출 스택은 "윗면"만 보여주므로 TV 화면·시계판·게시판 종이처럼
+ *  정면 벽에 붙는 그림은 여기서 그린다. 이 안에서 y 는 벽을 타고 올라간 실제 높이다(위가 −y).
+ *  월드 변환의 세로 압축(k)과 곱해져 화면에서는 sinφ 로 눌려 보이고, 그 눌림이 곧 입체감이다. */
+function wallSpace(drawFn) {
+  ctx.save();
+  ctx.scale(1, CAM25.tan);
+  drawFn();
+  ctx.restore();
+}
+
+/* 접지 그림자 : 광원 좌상단 고정 → 우하단 플랫 오프셋(로비 규칙 그대로, 블러 0).
+ *  월드 변환이 세로를 눌러 자동으로 타원이 된다 — ellipse() 를 직접 쓰면 이중 압축이다.
+ *  호출부(drawLobbyShadows)가 multiply 를 이미 켜 둔 상태로 부른다. */
+function groundShadow(x, y, r) { ctx.beginPath(); ctx.arc(x + 6, y + 5, r, 0, 7); ctx.fill(); }
+
+// 바닥에 놓인 원. 세로 압축은 월드 변환이 알아서 한다.
+function circleAt(r) { ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); }
+
+/* 크기가 고정된 단면은 모듈 로드 시 한 번 굽는다 (CARP·PLAZA_TICKS 와 같은 이유 —
+ *  겹마다 arcTo 4개를 다시 만들 이유가 없다). t 에 따라 크기가 변하는 단면만 매 겹 새로 그린다. */
+function bakeRect(w, h, r) { const p = new Path2D(); p.roundRect(-w / 2, -h / 2, w, h, r); return p; }
+
+// 작은 돌기(버튼·크라운·차막이) : 같은 단면을 h 만큼 밀어 올린다.
+function stub(x, y, h, section, side, top) {
+  ctx.save();
+  ctx.translate(x, y);
+  extrude(h, section, side, top);
+  ctx.restore();
+}
+
+/* =============================================================================
+ *  로비 게이트 오브젝트 8종 — 베이 안쪽 끝에 세워 두는 그룹 상징물.
+ * -----------------------------------------------------------------------------
+ *  측면색은 베이스색을 22% 어둡게 한 값이다. 새 헬퍼를 만들지 않고 기존 shadeHex 를
+ *  쓴다 — shadeHex(c, -0.22) 가 "× 0.78" 과 정확히 같은 연산이다(f<0 이면 1+f 를 곱한다).
+ * ========================================================================== */
+const OBJ_SIDE_F = -0.22;  // 오브젝트 측면 (= 베이스색 × 0.78)
+const PED_SIDE_F = -0.14;  // 좌대 측면    (= 게이트색 × 0.86)
+const PED_R = 48, PED_H = 18;   // 공통 좌대 : 원형 반지름 / 높이
+const OBJ_SHADOW_R = 54;        // 접지 그림자 반지름
+
+/* 오브젝트 접지점 : 게이트 안쪽(위쪽) 끝에서 28px 들어온 자리.
+ *  플레이어는 아래(LOBBY_SPAWN y1920)에서 위로 진입하므로 안쪽은 y 가 작은 쪽이다.
+ *  오브젝트는 여기서 −y 로 솟아 배경 쪽으로 뻗으므로 베이 입구를 막지 않는다. */
+function objBaseY(g) { return g.y - g.h / 2 + 28; }
+
+const STOP_BAR = bakeRect(64, 12, 6); // 베이 차막이 단면 (주차 베이 도색 4번)
+
+// 모양이 고정된 단면 콜백들 — 프레임마다 새 화살표를 만들지 않으려고 여기서 한 번만 묶는다.
+//  (SW_CROWN 은 아래 스톱워치 절에서 굽는다 — 호출은 렌더 시점이라 순서 문제가 없다.)
+const pedSection = () => circleAt(PED_R);
+const stopBarSection = () => STOP_BAR;
+const crownSection = () => SW_CROWN;
+const joyButtonSection = () => circleAt(7);
+
+/* ① 레이싱 — 트로피. 8종 중 유일하게 게이트색을 안 쓴다(트로피는 원래 금색인 물건이라
+ *  예외로 읽힌다). 순수 노랑이 60°, 주황이 30° 인데 본체를 39° 에 둔 것이 "노랑이 아니라
+ *  금인데 주황이 살짝 뜬다"의 실제 좌표다. 하이라이트만 45° 로 올려 밝은 쪽이 노랗게 뜬다 —
+ *  실제 금속이 그렇게 반사한다. 기존 GOLD(#ffd94d, 50°)는 관리자 차 색이라 여기 안 쓴다. */
+const TROPHY = { top: "#FFDE7A", side: "#F0B341", deep: "#BB8C33" };
+const TROPHY_BASE1 = bakeRect(96, 96, 14);
+const TROPHY_BASE2 = bakeRect(74, 74, 12);
+function trophyR(t) {
+  if (t < 0.41) return 13;                              // 기둥
+  if (t < 0.50) return lerp(13, 30, (t - 0.41) / 0.09); // 컵 밑굽
+  return 30 + 16 * Math.pow((t - 0.5) / 0.5, 0.72);     // 컵 (지수 0.72 = 살짝 오목)
+}
+function trophySection(t) {
+  if (t < 0.09) return TROPHY_BASE1;
+  if (t < 0.15) return TROPHY_BASE2;
+  const r = trophyR(t);
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, 7);
+  if (t >= 0.60 && t <= 0.90) { // 손잡이 : 컵 좌우에 붙는 원 두 개
+    const hx = r + 13;
+    ctx.moveTo(-hx + 9, 0); ctx.arc(-hx, 0, 9, 0, 7);
+    ctx.moveTo(hx + 9, 0); ctx.arc(hx, 0, 9, 0, 7);
+  }
+}
+function drawObjTrophy() {
+  extrude(150, trophySection, TROPHY.side, TROPHY.top,
+    (t) => (t < 0.15 ? TROPHY.deep : TROPHY.side),
+    (t) => {
+      if (t < 0.5) return; // 영롱 하이라이트 : 컵 구간만. 이 오브젝트의 유일한 장식이다.
+      const r = trophyR(t);
+      ctx.fillStyle = TROPHY.top;
+      // 좌상단 광원 쪽 세로 밴드(폭 = 단면 지름의 22%). 반높이를 0.8r 로 두면 밴드가
+      //  어느 x 에서도 단면 원 안에 들어가서 클립 없이 실루엣 밖으로 안 삐져나온다.
+      ctx.fillRect(-0.60 * r, -0.8 * r, 0.44 * r, 1.6 * r);
+    });
+}
+
+/* ② 아케이드 — 조이스틱 */
+const JOY_PLATE = bakeRect(96, 68, 16);
+const JOY_BTN_SIDE = shadeHex("#f2c94c", OBJ_SIDE_F); // 버튼 색은 고정이라 미리 계산
+function joySection(t) {
+  if (t < 0.55) { // 사다리꼴 박스 : 위로 갈수록 살짝 좁아진다
+    const u = t / 0.55, w = lerp(100, 96, u), h = lerp(72, 68, u);
+    roundRect(-w / 2, -h / 2, w, h, 16);
+    return;
+  }
+  if (t < 0.60) return JOY_PLATE;              // 상판
+  if (t < 0.86) { circleAt(6); return; }       // 스틱 샤프트
+  const u = (t - 0.86) / 0.14;                 // 볼탑 : u 0.5 에서 최대
+  circleAt(u < 0.5 ? lerp(6, 17, u / 0.5) : lerp(17, 13, (u - 0.5) / 0.5));
+}
+function drawObjJoystick(g) {
+  const side = shadeHex(g.color, OBJ_SIDE_F);
+  extrude(105, joySection, side, g.color);
+  // 상판(t=0.60) 위 버튼 3개 — 스틱보다 앞(+y)이라 압출 뒤에 그려야 자연스럽다
+  ctx.save();
+  ctx.translate(0, -0.60 * 105 * CAM25.tan);
+  for (const [bx, by] of [[-26, 14], [0, 20], [26, 14]]) {
+    stub(bx, by, 6, joyButtonSection, JOY_BTN_SIDE, "#f2c94c");
+  }
+  ctx.restore();
+}
+
+/* ③ 레트로 — 브라운관 TV. 카세트에서 바꿨다 : 납작한 판이라 압출해도 높이가 안 나온다. */
+const TV_BASE = bakeRect(84, 56, 10);
+function tvSection(t) {
+  if (t < 0.13) return TV_BASE;
+  const u = (t - 0.13) / 0.87, w = lerp(108, 104, u), h = lerp(84, 80, u); // 본체 : 위로 4% 축소
+  roundRect(-w / 2, -h / 2, w, h, 14);
+}
+function drawObjTV(g) {
+  const side = shadeHex(g.color, OBJ_SIDE_F);
+  extrude(120, tvSection, side, g.color);
+  wallSpace(() => {
+    ctx.fillStyle = "#3a3a3a";                       // 화면
+    roundRect(-38, -99, 76, 54, 10); ctx.fill();
+    ctx.fillStyle = "rgba(255,255,255,0.10)";        // 주사선
+    for (let i = 0; i < 3; i++) ctx.fillRect(-34, -90 + i * 12, 68, 3);
+    ctx.fillStyle = "#f2efe8";                       // 노브
+    ctx.beginPath(); ctx.arc(44, -80, 5, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(44, -62, 5, 0, 7); ctx.fill();
+    ctx.strokeStyle = side; ctx.lineWidth = 4; ctx.lineCap = "round"; // 안테나
+    for (const s of [-1, 1]) {
+      const a = s * 38 * Math.PI / 180;
+      ctx.beginPath();
+      ctx.moveTo(0, -120);
+      ctx.lineTo(Math.sin(a) * 46, -120 - Math.cos(a) * 46);
+      ctx.stroke();
+    }
+  });
+}
+
+/* ④ 광장 — 시계탑. 문자판은 광장 맵의 랜드마크(drawPlazaClock)를 그대로 줄여 붙인다.
+ *  세계관이 이어지고, 바늘이 실제 현재 시각으로 돈다 — 8종 중 유일하게 매 프레임 살아 있다. */
+function towerSection(t) {
+  if (t < 0.10) { circleAt(lerp(42, 34, t / 0.10)); return; }          // 받침
+  if (t < 0.82) { circleAt(30); return; }                              // 기둥
+  if (t < 0.90) { circleAt(lerp(30, 40, (t - 0.82) / 0.08)); return; } // 처마
+  circleAt(lerp(40, 4, (t - 0.90) / 0.10));                            // 원뿔 지붕
+}
+function drawObjClockTower(g) {
+  extrude(145, towerSection, shadeHex(g.color, OBJ_SIDE_F), g.color);
+  wallSpace(() => {
+    ctx.save();
+    ctx.translate(0, -96);
+    ctx.scale(34 / PLAZA.faceR, 34 / PLAZA.faceR); // 반지름 400 기준으로 짜인 것을 34 로
+    ctx.translate(-PLAZA.cx, -PLAZA.cy);           // drawPlazaClock 이 절대좌표를 쓰므로 상쇄
+    drawPlazaClock();
+    ctx.restore();
+  });
+}
+
+/* ⑤ 주행 테스트 — 라바콘 3개. 원뿔은 압출만으로 완결된다(데칼 없음). */
+const CONE_BASE = bakeRect(58, 58, 8);
+const CONES = [[0, 0, 100], [-46, 12, 78], [46, 12, 78]]; // y 오름차순 = 뒤에서 앞으로
+function coneSection(t) {
+  if (t < 0.08) return CONE_BASE;
+  circleAt(lerp(24, 4, (t - 0.08) / 0.92));
+}
+function drawObjCones(g) {
+  const side = shadeHex(g.color, OBJ_SIDE_F);
+  // 흰 반사띠 두 줄 — 원뿔 높이의 특정 구간만 색을 갈아 끼운다
+  const band = (t) => ((t >= 0.42 && t <= 0.55) || (t >= 0.66 && t <= 0.79)) ? "#f2efe8" : side;
+  for (const [cx, cy, h] of CONES) {
+    ctx.save();
+    ctx.translate(cx, cy);
+    extrude(h, coneSection, side, g.color, band);
+    ctx.restore();
+  }
+}
+
+/* ⑥ 연습 — 스톱워치 */
+const SW_BASE = bakeRect(70, 46, 10);
+const SW_CROWN = bakeRect(16, 10, 5);
+function swSection(t) {
+  if (t < 0.08) return SW_BASE;                                       // 거치대
+  if (t < 0.92) { circleAt(40); return; }                             // 몸통(세워진 원통)
+  circleAt(lerp(40, 34, (t - 0.92) / 0.08));                          // 베젤
+}
+function drawObjStopwatch(g) {
+  const side = shadeHex(g.color, OBJ_SIDE_F);
+  extrude(120, swSection, side, g.color);
+  ctx.save();
+  ctx.translate(0, -120 * CAM25.tan);
+  stub(0, 0, 12, crownSection, side, "#f2efe8"); // 크라운
+  ctx.restore();
+  wallSpace(() => {
+    const cy = -62;
+    ctx.fillStyle = "#fbf7ee"; ctx.beginPath(); ctx.arc(0, cy, 32, 0, 7); ctx.fill();
+    ctx.strokeStyle = "#b6ac98"; ctx.lineWidth = 2.5;   // 눈금 12개
+    ctx.beginPath();
+    for (let i = 0; i < 12; i++) {
+      const a = i * Math.PI / 6, c = Math.cos(a), s = Math.sin(a);
+      ctx.moveTo(c * 26, cy + s * 26); ctx.lineTo(c * 32, cy + s * 32);
+    }
+    ctx.stroke();
+    // 바늘은 계측 전이라 멈춰 있다 (분침 12시 / 초침 4시) — 광장 시계와 달리 살아 있지 않다
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "#3a3a3a"; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(0, cy - 22); ctx.stroke();
+    ctx.strokeStyle = "#e8604c"; ctx.lineWidth = 3;
+    const a4 = 4 * Math.PI / 6 - Math.PI / 2;
+    ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(Math.cos(a4) * 26, cy + Math.sin(a4) * 26); ctx.stroke();
+    ctx.fillStyle = "#3a3a3a"; ctx.beginPath(); ctx.arc(0, cy, 3.5, 0, 7); ctx.fill();
+  });
+}
+
+/* ⑦ 베타 테스트 — 플라스크 */
+function flaskSection(t) {
+  if (t < 0.62) { circleAt(lerp(44, 13, t / 0.62)); return; } // 원뿔 몸통
+  if (t < 0.94) { circleAt(13); return; }                     // 목
+  circleAt(lerp(13, 17, (t - 0.94) / 0.06));                  // 립
+}
+function drawObjFlask(g) {
+  const side = shadeHex(g.color, OBJ_SIDE_F);
+  // 내용물(노랑) + 액면 하이라이트 한 겹. "경계에 걸친 한 겹"은 extrudeStep 으로 집는다.
+  const fill = (t) => (t < 0.30 ? (t + extrudeStep >= 0.30 ? "#ffe08a" : "#f2c94c") : side);
+  extrude(115, flaskSection, side, g.color, fill);
+  wallSpace(() => { // 목 위로 떠오르는 기포
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    for (const [h, r] of [[8, 4], [18, 3], [26, 2]]) {
+      ctx.beginPath(); ctx.arc(0, -115 - h, r, 0, 7); ctx.fill();
+    }
+  });
+}
+
+/* ⑧ 커스텀 — 게시판. 게이트가 팝업 없이 방 목록으로 직행하므로 "게시판 = 방 목록"이 맞다. */
+const BOARD_BASE = bakeRect(92, 36, 8);
+const BOARD_PLATE = bakeRect(104, 16, 6); // 세워진 판이라 단면이 납작한 게 맞다
+const BOARD_POSTS = (() => {
+  const p = new Path2D();
+  p.moveTo(-26, 0); p.arc(-34, 0, 8, 0, 7);
+  p.moveTo(42, 0); p.arc(34, 0, 8, 0, 7);
+  return p;
+})();
+const BOARD_PAPERS = [[-32, -104, -4], [0, -97, 2], [32, -103, -2]]; // x, y, 기울기(도)
+function boardSection(t) {
+  if (t < 0.06) return BOARD_BASE;
+  if (t < 0.52) return BOARD_POSTS;
+  return BOARD_PLATE;
+}
+function drawObjBoard(g) {
+  extrude(130, boardSection, shadeHex(g.color, OBJ_SIDE_F), g.color);
+  wallSpace(() => {
+    ctx.fillStyle = "#fbf7ee";                    // 판면
+    roundRect(-50, -130, 100, 62, 8); ctx.fill();
+    for (const [px, py, deg] of BOARD_PAPERS) {   // 종이 3장 + 압정
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate(deg * Math.PI / 180);
+      ctx.fillStyle = "#f2efe8"; roundRect(-13, -10, 26, 20, 3); ctx.fill();
+      ctx.fillStyle = "#e8604c"; ctx.beginPath(); ctx.arc(0, -6, 3, 0, 7); ctx.fill();
+      ctx.restore();
+    }
+  });
+}
+
+// 게이트 그룹 → 오브젝트. 차고는 없다(베이 바닥 도색만).
+const LOBBY_OBJECTS = {
+  racing:   { draw: drawObjTrophy },
+  arcade:   { draw: drawObjJoystick },
+  retro:    { draw: drawObjTV },
+  plaza:    { draw: drawObjClockTower },
+  test:     { draw: drawObjCones },
+  practice: { draw: drawObjStopwatch },
+  beta:     { draw: drawObjFlask },
+  custom:   { draw: drawObjBoard },
+};
+
+// 오브젝트 하나 : 공통 좌대를 깔고 그 윗면에서 본체를 세운다.
+function drawLobbyObject(g) {
+  const o = LOBBY_OBJECTS[g.group];
+  if (!o) return;
+  ctx.save();
+  ctx.translate(g.x, objBaseY(g));
+  extrude(PED_H, pedSection, shadeHex(g.color, PED_SIDE_F), g.color);
+  ctx.translate(0, -PED_H * CAM25.tan);
+  o.draw(g);
+  ctx.restore();
+}
+
+/* 로비 그림자 : 오브젝트 접지 그림자를 차 그림자와 같은 multiply 배치에 합류시킨다.
+ *  오브젝트용으로 컴포짓을 따로 켜면 GPU 렌더패스가 그 횟수만큼 더 끊긴다
+ *  (drawCarShadows 가 multiply 를 한 번만 켜는 것과 같은 이유. 모바일에서 특히 비싸다). */
+function drawLobbyShadows(cars) {
+  ctx.save();
+  ctx.globalCompositeOperation = "multiply";
+  ctx.fillStyle = PALETTE.gateShadow;
+  for (const g of LOBBY_GATES) {
+    if (!LOBBY_OBJECTS[g.group]) continue;
+    if (!inView(g.x, objBaseY(g), 160)) continue;
+    groundShadow(g.x, objBaseY(g), OBJ_SHADOW_R);
+  }
+  ctx.fillStyle = PALETTE.carShadowLobby;
+  for (const c of cars) drawCarShadow(c);
+  ctx.restore();
+}
+
+/* 로비 정렬 렌더 : 세워진 오브젝트와 차를 접지점 y 로 한데 정렬해 그린다.
+ *  y 가 작을수록 멀다(뒤) → 먼저 그린다. 정렬이 없으면 차가 오브젝트를 뚫고 지나간다. */
+const lobbyDrawList = []; // 매 프레임 재사용
+function drawLobbySorted(car, meVisible) {
+  lobbyDrawList.length = 0;
+  for (const g of LOBBY_GATES) {
+    if (!LOBBY_OBJECTS[g.group]) continue;
+    // 컬링은 지켜야 한다 — 압출은 오브젝트 하나가 100겹 넘는 fill 이라 화면 밖까지
+    //  그리면 프레임이 그대로 무너진다. viewBox 위쪽 여유(MAX_OBJ_H×tanφ)가 키를 흡수한다.
+    if (!inView(g.x, objBaseY(g), 160)) continue;
+    lobbyDrawList.push({ y: objBaseY(g), g, c: null });
+  }
+  for (const r of visibleRemotes) lobbyDrawList.push({ y: r.y, g: null, c: r });
+  if (meVisible) lobbyDrawList.push({ y: car.y, g: null, c: car });
+  lobbyDrawList.sort((a, b) => a.y - b.y);
+  for (const d of lobbyDrawList) {
+    if (d.g) drawLobbyObject(d.g);
+    else drawCar(d.c, d.c === car ? myColor() : (d.c.color || colorForId(d.c.id)));
+  }
+}
+
+/* 로비 바닥 : 웜 화이트 + 보일 듯 말 듯한 격자 + 주차 베이(아스팔트 도색).
+ *  광원 좌상단 고정 → 접지 그림자는 우하단 플랫 오프셋(#E9E4D8, 블러 0).
+ *  세워진 오브젝트는 여기서 안 그린다 — 차와 깊이 정렬해야 해서 render() 가 맡는다. */
 function drawLobbyGround() {
   const W = world.w, H = world.h;
   ctx.fillStyle = PALETTE.bg;
@@ -3026,7 +3493,8 @@ function drawLobbyGround() {
   ctx.lineWidth = 1;
   ctx.beginPath();
   const vx0 = camera.x, vx1 = camera.x + viewW / camera.zoom;
-  const vy0 = camera.y, vy1 = camera.y + viewH / camera.zoom;
+  //  2.5D : 세로 가시 범위가 1/k 로 늘어났다. 여기서 안 눌러 주면 격자가 화면 중간에서 끊긴다.
+  const vy0 = camera.y, vy1 = camera.y + viewH / (camera.zoom * CAM25.k);
   const ix0 = Math.max(0, Math.floor(vx0 / gx)), ix1 = Math.min(Math.round(W / gx), Math.ceil(vx1 / gx));
   const iy0 = Math.max(0, Math.floor(vy0 / gy)), iy1 = Math.min(Math.round(H / gy), Math.ceil(vy1 / gy));
   const y0 = Math.max(0, vy0), y1 = Math.min(H, vy1);
@@ -3035,36 +3503,55 @@ function drawLobbyGround() {
   for (let j = iy0; j <= iy1; j++) { const y = j * gy; ctx.moveTo(x0, y); ctx.lineTo(x1, y); }
   ctx.stroke();
 
-  // 모드 게이트 : 순수 평면 컬러 패치 (그림자/깊이 효과 없음)
+  /* 모드 게이트 : 주차 베이. 판정 사각형(250×150)은 그대로 두고 도색만 바꾼다 —
+   *  게이트 진입 판정(updateLobby)과 클릭 판정은 여전히 이 사각형이 히트박스다. */
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   for (const g of LOBBY_GATES) {
     const gx = g.x - g.w / 2, gy = g.y - g.h / 2, r = 30;
-    ctx.fillStyle = g.color;
+    ctx.fillStyle = g.color;                      // 1) 베이스
     roundRect(gx, gy, g.w, g.h, r);
     ctx.fill();
+    ctx.fillStyle = "rgba(255,255,255,0.12)";     // 2) 도색 톤 : 채도를 죽여 아스팔트에 칠한 색으로
+    roundRect(gx, gy, g.w, g.h, r);
+    ctx.fill();
+    ctx.strokeStyle = "#ffffff";                  // 3) 구획선 : 좌우 세로 2줄
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    for (const s of [-1, 1]) {
+      const x = g.x + s * (g.w / 2 - 10);
+      ctx.moveTo(x, g.y - (g.h / 2 - 12));
+      ctx.lineTo(x, g.y + (g.h / 2 - 12));
+    }
+    ctx.stroke();
+    // 4) 차막이 : 안쪽 끝(y 작은 쪽)에 낮은 압출 막대 둘. 차고는 오브젝트가 없어 차막이도 없다.
+    if (g.group !== "garage") {
+      const stopSide = shadeHex(g.color, -0.28);
+      const by = g.y - g.h / 2 + 16;
+      for (const s of [-1, 1]) stub(g.x + s * 46, by, 10, stopBarSection, stopSide, g.color);
+    }
 
     const entering = lobby.gate === g && lobby.prog > 0;
     if (!entering) {
-      // 라벨 + 서브라벨 (모드 = "N명 접속 중", 커스텀 = 설명)
+      /* 5) 라벨 : 바닥 도색이라 역보정하지 않는다 — 눌린 채로 그려져야 칠한 글씨로 읽힌다.
+       *  서브라벨(N명 접속 중)은 뺐다. 베이 아래쪽에 글씨가 두 줄이면 오브젝트와 함께 답답하고,
+       *  2.5D 에선 눌려서 읽히지도 않는다. */
       ctx.fillStyle = "#ffffff";
       ctx.font = "400 30px Jua, sans-serif";
-      ctx.fillText(g.label, g.x, g.y - 16);
-      ctx.fillStyle = "rgba(255,255,255,0.85)";
-      ctx.font = "400 20px Jua, sans-serif";
-      ctx.fillText(gateSub(g), g.x, g.y + 28);
+      ctx.fillText(g.label, g.x, g.y + g.h / 2 - 30);
     } else {
-      // 진입 도넛 : 12시(0도)에서 시작해 시계방향으로 채워짐 → 가득 차면 입장
+      // 진입 도넛 : 12시(0도)에서 시작해 시계방향으로 채워짐 → 가득 차면 입장.
+      //  오브젝트에 가리지 않도록 중심을 베이 가운데(+10)로 내렸다. 바닥에 그린다(역보정 없음).
       const pr = clamp(lobby.prog, 0, 1);
       ctx.lineWidth = 11;
       ctx.strokeStyle = "rgba(255,255,255,0.28)"; // 트랙(비어있는 도넛)
       ctx.beginPath();
-      ctx.arc(g.x, g.y, 42, 0, Math.PI * 2);
+      ctx.arc(g.x, g.y + 10, 42, 0, Math.PI * 2);
       ctx.stroke();
       ctx.strokeStyle = "#ffffff";                // 채워지는 진행분
       ctx.lineCap = "round";
       ctx.beginPath();
-      ctx.arc(g.x, g.y, 42, -Math.PI / 2, -Math.PI / 2 + pr * Math.PI * 2);
+      ctx.arc(g.x, g.y + 10, 42, -Math.PI / 2, -Math.PI / 2 + pr * Math.PI * 2);
       ctx.stroke();
     }
   }
@@ -3073,22 +3560,6 @@ function drawLobbyGround() {
 
 /* 커스텀 링 픽커 : 차를 중심으로 32색 스와치가 원형 배치. 클릭=선택(즉시 저장),
  *  호버=확대, 현재 색=잉크 링 표시. 출발하면 닫힌다. */
-// 게이트 서브라벨 : 그룹에 속한 모드들의 접속 인원 합, 또는 안내 문구
-function gateSub(g) {
-  switch (g.group) {
-    case "retro": return `${(modeCounts.retro1 || 0) + (modeCounts.retro2 || 0)}명 접속 중`; // 레트로 = 초보자+어려움
-    case "arcade": return `${modeCounts.boss || 0}명 접속 중`; // 보스전 접속 수 (다른 맵은 준비 중)
-    case "racing": return `${(modeCounts.rank || 0) + (modeCounts.casual || 0)}명 접속 중`; // 일반전 + 경쟁전 (캐주얼은 아직 준비 중)
-    case "plaza": return `${modeCounts.plaza || 0}명 접속 중`;
-    case "custom": return `${modeCounts.pro || 0}명 접속 중`;
-    // 연습 = 실제 코스(A-1~3 + B-1~3 + C-1~3) 멀티플레이 접속 수
-    case "practice": return `${(modeCounts.a1 || 0) + (modeCounts.a2 || 0) + (modeCounts.a3 || 0) + (modeCounts.racing || 0) + (modeCounts.hard || 0) + (modeCounts.serp || 0) + (modeCounts.c1 || 0) + (modeCounts.c2 || 0) + (modeCounts.c3 || 0) + (modeCounts.d1 || 0)}명 접속 중`;
-    case "test": return `${modeCounts.test || 0}명 접속 중`;
-    case "beta": return "1인 플레이";
-    case "garage": return "차 색상 바꾸기";
-    default: return "";
-  }
-}
 
 function customSwatchAngle(i) {
   return -Math.PI / 2 + (i * 2 * Math.PI) / CAR_COLORS.length;
@@ -3252,7 +3723,8 @@ function drawSkid() {
   ctx.lineWidth = 4.5;  // 타이어 폭 느낌
   // 뷰포트 컬링 범위 (월드 좌표, 여유 120px — 화면 흔들림 오프셋까지 커버)
   const vx0 = camera.x - 120, vy0 = camera.y - 120;
-  const vx1 = camera.x + viewW / camera.zoom + 120, vy1 = camera.y + viewH / camera.zoom + 120;
+  const vx1 = camera.x + viewW / camera.zoom + 120;
+  const vy1 = camera.y + viewH / (camera.zoom * CAM25.k) + 120; // 2.5D : 세로 범위 1/k
   // 배칭 : (색, 알파 버킷 0~10) 별로 한 path 에 모아 stroke 횟수를 최대 1400 → ~10회로
   const buckets = new Map(); // key -> {path, alpha, color}
   for (const m of skidMarks) {
@@ -3593,13 +4065,33 @@ function drawCarShadows(cars) {
   ctx.restore();
 }
 
+/* 차량 압출(실험) : 바디+미러 통합 실루엣(CARP.shadow)을 월드 y 로 겹겹이 밀어 올려
+ *  옆면을 만든다. 압출은 "월드 위쪽"으로 가야 하므로 차 회전 밖에서 y 만 옮긴다 —
+ *  회전 안에서 올리면 차가 향한 쪽으로 번진다. 올린 높이를 돌려주고, 기존 디테일은
+ *  호출부가 그 높이의 꼭대기 레이어에 그대로 얹는다(drawCar 본문은 손대지 않는다). */
+function drawCarStack(car, color, rot, s) {
+  const rise = CAR_EXTRUDE * CAM25.tan;
+  const N = Math.max(6, Math.ceil(CAR_EXTRUDE * CAM25.sin * 2));
+  ctx.save();
+  ctx.fillStyle = shadeHex(color, -0.26);
+  for (let i = 0; i < N; i++) {
+    ctx.save();
+    carShapeTransform(car.x, car.y - rise * (i / (N - 1)), rot, s);
+    ctx.fill(CARP.shadow);
+    ctx.restore();
+  }
+  ctx.restore();
+  return rise;
+}
+
 function drawCar(car, color = "#e8604c") {
   const L = car.length || CAR.length;
   const s = ((L + 10) / 232) * 1.15;  // 시각 크기 1.15배 (충돌 크기는 그대로)
   const rot = car.angle + Math.PI / 2; // 쉐입 전방(-y) → car.angle 전방(+x)
+  const lift = CAR_EXTRUDE > 0 ? drawCarStack(car, color, rot, s) : 0;
 
   ctx.save();
-  carShapeTransform(car.x, car.y, rot, s);
+  carShapeTransform(car.x, car.y - lift, rot, s);
 
   // ---- 바디 + 사이드미러 + 은은한 아웃라인(바닥과 분리, 튀지 않게) ----
   //  아웃라인 = 바디색을 살짝 어둡게 (밝은 색이면 웜 그레이) → 어떤 색이든 자연스러운 테두리.
@@ -4563,6 +5055,7 @@ function handleRaceMessage(msg) {
 function returnToWaitingRoom() {
   gameMode = "lobby";
   world = WORLD.lobby;
+  syncPitch(); // 로비로 돌아왔으니 다시 눕힌다
   gameState = "playing";
   remotePlayers.clear();
   skidMarks.length = 0;
@@ -4596,6 +5089,7 @@ function returnToWaitingRoom() {
 function enterFreeRacingFromPro() {
   gameMode = "racing";
   world = WORLD.racing;
+  syncPitch(); // 로비 밖은 항등(탑뷰)
   remotePlayers.clear();
   skidMarks.length = 0;
   explosions.length = 0;
@@ -5690,6 +6184,7 @@ function wipeTo(swap, info) {
 function startGame(mode) {
   gameMode = mode;
   world = WORLD[mode];
+  syncPitch(); // 로비 밖은 항등(탑뷰)으로 — 안 되돌리면 트랙이 눌린 채로 시작한다
 
   // 이름 확정 : 로그인 = 계정 닉네임, 비로그인 = 저장된 이름 (닉네임 편집은 계정 팝업에서)
   if (account.loggedIn) {
@@ -5791,6 +6286,7 @@ function enterLobby() {
   sendLeave();
   gameMode = "lobby";
   world = WORLD.lobby;
+  syncPitch(); // 로비만 눕는다
   gameState = "playing"; // 로비도 실제 주행 상태 (물리/렌더 모두 동작)
   race.state = "none";
   remotePlayers.clear();
@@ -5999,6 +6495,7 @@ function placeOnProGrid() {
 function enterProStage() {
   gameMode = "pro";
   world = WORLD.pro;
+  syncPitch(); // 로비 밖은 항등(탑뷰) — 안 되돌리면 트랙이 눌린 채로 시작한다
   remotePlayers.clear();
   skidMarks.length = 0;
   explosions.length = 0;
@@ -6276,8 +6773,8 @@ function setupLobbyUI() {
     if (gameMode !== "lobby") {
       // 인게임 : 다른 플레이어 차량 클릭 → 상대 프로필 팝업 (보스 제외)
       if (gameState !== "playing") return;
-      const cwx = camera.x + e.clientX / camera.zoom;
-      const cwy = camera.y + e.clientY / camera.zoom;
+      const cwx = screenToWorldX(e.clientX);
+      const cwy = screenToWorldY(e.clientY);
       let hit = null, hd = 70; // 차 시각 반길이(27.6)보다 넉넉한 클릭 반경
       for (const [id, r] of remotePlayers) {
         if (gameMode === "boss" && id === BOSS_EID) continue;
@@ -6287,8 +6784,8 @@ function setupLobbyUI() {
       if (hit != null) { SFX.click(); openPlayerInfo(hit); }
       return;
     }
-    const wx = camera.x + e.clientX / camera.zoom;
-    const wy = camera.y + e.clientY / camera.zoom;
+    const wx = screenToWorldX(e.clientX);
+    const wy = screenToWorldY(e.clientY);
     if (custom.active) {
       const i = hitCustomSwatch(wx, wy);
       if (i >= 0) {
@@ -6360,8 +6857,8 @@ function setupLobbyUI() {
       if (canvas.style.cursor) canvas.style.cursor = "";
       return;
     }
-    const wx = camera.x + e.clientX / camera.zoom;
-    const wy = camera.y + e.clientY / camera.zoom;
+    const wx = screenToWorldX(e.clientX);
+    const wy = screenToWorldY(e.clientY);
     canvas.style.cursor = hitCustomSwatch(wx, wy) >= 0 ? "pointer" : "";
   });
 

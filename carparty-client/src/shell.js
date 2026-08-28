@@ -20,7 +20,9 @@
  *   · 포커스  키보드 이벤트는 포커스된 문서에만 간다. 프레임을 계속 잡아둔다.
  * ========================================================================== */
 
-const FRAME_SRC = "/play.html";
+//  base 기준 경로다. 기본값이 "/" 라 종전과 같은 "/play.html" 이고, 하위 경로로
+//  배포하면(BASE_PATH) 거기에 맞춰 따라간다 — 안 그러면 프레임이 404 로 빈다.
+const FRAME_SRC = import.meta.env.BASE_URL + "play.html";
 const frame = document.getElementById("stage");
 
 /* 셸 ↔ 프레임 공유 토큰. 프레임이 하트비트에 실어 되돌려주므로, 우리가 띄운
@@ -135,7 +137,10 @@ setInterval(() => {
 /* --- 서비스워커 (PWA 설치 자격 + 오프라인 폴백) ----------------------------
  *  최상위 문서에서 등록해야 셸이 컨트롤 대상이 된다. 개발 중에는 등록하지
  *  않는다 — Vite 개발 자원까지 캐시하면 HMR 이 stale 해진다. */
-if (import.meta.env.PROD && "serviceWorker" in navigator) {
+/*  서비스워커는 루트 배포에서만 건다. sw.js 의 셸 목록("/", "/play" …)이 루트
+ *  절대경로로 박혀 있어서, 하위 경로로 배포하면 엉뚱한 걸 캐시하고 그 뒤로는
+ *  새로 올린 코드가 안 보이는 함정이 된다(실험 페이지에선 PWA 가 필요도 없다). */
+if (import.meta.env.PROD && import.meta.env.BASE_URL === "/" && "serviceWorker" in navigator) {
   window.addEventListener("load", () => {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
   });

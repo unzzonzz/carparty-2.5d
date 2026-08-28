@@ -137,6 +137,11 @@ export default defineConfig(({ mode }) => ({
     //  (NO_OBFUSCATE=1 과 함께 쓰면 배포 산출물을 그대로 디버깅할 수 있다).
     drop: mode === "production" ? ["console", "debugger"] : [],
   },
+  /* 배포 루트. 기본은 "/" 라 Cloudflare Pages·서버 직접 서빙은 종전 그대로다.
+   *  GitHub Pages 프로젝트 페이지처럼 하위 경로(/carparty-2.5d/)로 서빙할 때만
+   *  BASE_PATH 로 넘긴다 — 그러면 Vite 가 HTML 안의 /assets, /car-icon.svg 같은
+   *  절대경로를 전부 앞에 base 를 붙여 다시 쓴다. */
+  base: process.env.BASE_PATH || "/",
   build: {
     outDir: "dist",
     // 소스맵은 배포하지 않는다. 난독화를 해 놓고 원본 대조표를 같이 올리면

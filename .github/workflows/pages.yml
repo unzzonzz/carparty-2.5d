@@ -1,0 +1,60 @@
+# GitHub Pages 배포 — 2.5D 로비 실험을 눈으로 보라고 띄우는 용도다.
+#
+#  이 저장소는 워크스페이스를 평평하게 복사한 것이라 앱이 carparty-client/ 안에 있고,
+#  Vite 프로젝트라 빌드를 거쳐야 브라우저가 읽는다(JSX·ESM 원본은 그대로는 안 돈다).
+#  Pages 는 프로젝트 페이지라 /carparty-2.5d/ 하위로 서빙되므로 BASE_PATH 를 넘긴다.
+#
+#  난독화와 devtools 방해는 끈다 — 소스가 이 저장소에 공개돼 있어 난독화가 의미 없고,
+#  실험 페이지를 열어 보다 debugger 루프에 걸리면 방해만 된다.
+#
+#  게임 서버(/ws)는 여기 없다. 로비는 로컬 전용이라 그대로 돌지만, 서버가 필요한
+#  모드는 연결에 실패한다. 실서버에 붙이려면 VITE_WS_URL 을 넣으면 된다(기본은 안 넣는다 —
+#  실험 빌드가 운영 서버 방에 들어가는 건 의도가 아니다).
+name: Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: carparty-client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: carparty-client/package-lock.json
+      - run: npm ci
+      - run: npm run build
+        env:
+          BASE_PATH: /carparty-2.5d/
+          NO_OBFUSCATE: "1"
+          NO_DEVTOOLS_TRAP: "1"
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: carparty-client/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -23,7 +23,7 @@
  *  루프가 생기지 않는다. 리다이렉트 뒤에도 이 모듈의 나머지는 계속 평가되지만,
  *  곧 문서가 날아가므로 문제되지 않는다. */
 export const framed = window.self !== window.top;
-if (!framed) location.replace("/" + location.search);
+if (!framed) location.replace(import.meta.env.BASE_URL + location.search);
 
 /* --- 2) 네이티브 선점 ------------------------------------------------------
  *  모듈 최상단 = 엔진보다 먼저 평가된다(main.jsx 가 이 모듈을 첫 줄에 import).
